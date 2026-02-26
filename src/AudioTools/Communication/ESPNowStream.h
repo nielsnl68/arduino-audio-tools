@@ -1,7 +1,8 @@
 #pragma once
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h>
+#include "esp_mac.h"
+//#include <esp_wifi.h>
 
 #include "AudioTools/Concurrency/RTOS.h"
 #include "AudioTools/CoreAudio/AudioBasic/StrView.h"
@@ -27,8 +28,10 @@ namespace audio_tools {
 // forward declarations
 class ESPNowStream;
 static ESPNowStream* ESPNowStreamSelf = nullptr;
-static const char* BROADCAST_MAC_STR = "FF:FF:FF:FF:FF:FF";
-static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+using ESPNowAddress = std::array<uint8_t, ESP_NOW_ETH_ALEN>;
+
+static const ESPNowAddress BROADCAST_MAC = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 /**
  * @brief Configuration for ESP-NOW protocolö.W
@@ -40,7 +43,9 @@ struct ESPNowStreamConfig {
   wifi_mode_t wifi_mode = WIFI_STA;
   /// MAC address to use for the ESP-NOW interface (nullptr for default).
   /// Default: nullptr
+  /// mac_address is depricated, use own_address
   const char* mac_address = nullptr;
+  ESPNowAddress own_address;
   /// Size of each ESP-NOW packet buffer (bytes). Default: 1470 or 240 depending
   /// on esp-idf version
   uint16_t buffer_size = MY_ESP_NOW_MAX_LEN;
@@ -197,13 +202,13 @@ class ESPNowStream : public BaseStream {
       LOGE("addPeer before begin");
       return false;
     }
-    if (memcmp(BROADCAST_MAC, peer.peer_addr, 6) == 0) {
+    if (memcmp(BROADCAST_MAC.data(), peer.peer_addr, 6) == 0) {
       LOGI("Using broadcast");
       is_broadcast = true;
     }
     esp_err_t result = esp_now_add_peer(&peer);
     if (result == ESP_OK) {
-      LOGI("addPeer: %s", mac2str(peer.peer_addr));
+      LOGI("addPeer: %" MACSTR, MAC2STR(peer.peer_addr));
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
       esp_now_rate_config_t rate_config = {.phymode = cfg.phymode,
                                            .rate = cfg.rate,
@@ -223,9 +228,15 @@ class ESPNowStream : public BaseStream {
   }
 
   /// Adds a peer to which we can send info or from which we can receive info
-  bool addPeer(const uint8_t* address) {
+  bool addPeer(ESPNowAddress address) {
     esp_now_peer_info_t peer;
-    memcpy(peer.peer_addr, address, ESP_NOW_ETH_ALEN);
+
+    if (address == cfg.own_address) {
+      LOGW("Do not add own address as peer");
+      return true;
+    }
+
+    memcpy(peer.peer_addr, address.data(), ESP_NOW_ETH_ALEN);
 
     peer.channel = cfg.channel;
     peer.ifidx = getInterface();
@@ -239,22 +250,20 @@ class ESPNowStream : public BaseStream {
   }
 
   /// Adds a peer to which we can send info or from which we can receive info
+  [[deprecated]]
   bool addPeer(const char* address) {
-    if (StrView(address).equals(cfg.mac_address)) {
-      LOGW("Did not add own address as peer");
-      return true;
-    }
 
-    uint8_t mac[] = {0, 0, 0, 0, 0, 0};
-    if (!str2mac(address, (uint8_t*)&mac)) {
+    ESPNowAddress mac;
+    if (!str2mac(address, mac.data())) {
       LOGE("addPeer - Invalid address: %s", address);
       return false;
     }
-    return addPeer((const uint8_t*)&mac);
+    return addPeer(mac);
   }
 
   /// Adds an array of peers
-  template <size_t size>
+
+  template <size_t size> [[deprecated]]
   bool addPeers(const char* (&array)[size]) {
     bool result = true;
     for (int j = 0; j < size; j++) {
@@ -270,12 +279,11 @@ class ESPNowStream : public BaseStream {
 
   /// Adds an array of peers
   template <size_t N>
-  bool addPeers(const uint8_t (&array)[N][6]) {
+  bool addPeers(const ESPNowAddress (&array)[N]) {
     bool result = true;
     for (int j = 0; j < N; j++) {
-      const uint8_t* peer = array[j];
-      if (peer != nullptr) {
-        if (!addPeer(peer)) {
+      if (array[j][0] != 0) {
+        if (!addPeer(array[j])) {
           result = false;
         }
       }
@@ -407,11 +415,17 @@ class ESPNowStream : public BaseStream {
 
   bool setupMAC() {
     // set mac address
-    if (cfg.mac_address != nullptr) {
-      LOGI("setting mac %s", cfg.mac_address);
-      byte mac[ESP_NOW_KEY_LEN];
-      str2mac(cfg.mac_address, mac);
-      if (esp_wifi_set_mac((wifi_interface_t)getInterface(), mac) != ESP_OK) {
+    if (cfg.mac_address != nullptr && cfg.own_address[0] == 0) {
+      ESPNowAddress mac;
+      str2mac(cfg.mac_address, mac.data());
+      cfg.own_address = mac;
+    }
+
+
+    if (cfg.own_address[0] != 0) {
+      LOGI("Setting internel mac to : " MACSTR, MAC2STR(cfg.own_address.data()));
+
+      if (esp_wifi_set_mac((wifi_interface_t)getInterface(), cfg.own_address.data()) != ESP_OK) {
         LOGE("Could not set mac address");
         return false;
       }
@@ -420,9 +434,12 @@ class ESPNowStream : public BaseStream {
       delay(cfg.delay_after_updating_mac_ms);
 
       // checking if address has been updated
-      const char* addr = macAddress();
-      if (strcmp(addr, cfg.mac_address) != 0) {
-        LOGE("Wrong mac address: %s", addr);
+      uint8_t addr[6];
+      Network.macAddress(addr);
+      LOGI("Internel mac is now : " MACSTR, MAC2STR(addr));
+
+      if (memcmp(addr, cfg.own_address.data(), 6) != 0) {
+        LOGE("Wrong mac address: " MACSTR, MAC2STR(addr));
         return false;
       }
     }
@@ -480,7 +497,7 @@ class ESPNowStream : public BaseStream {
     TRACED();
     const uint8_t* target = destination;
     if (target == nullptr && is_broadcast) {
-      target = BROADCAST_MAC;
+      target = BROADCAST_MAC.data();
     }
 
     while (true) {
@@ -671,14 +688,6 @@ class ESPNowStream : public BaseStream {
     return strlen(mac) == 17;
   }
 
-  const char* mac2str(const uint8_t* array) {
-    static char macStr[18];
-    memset(macStr, 0, 18);
-    snprintf(macStr, 18, "%02x:%02x:%02x:%02x:%02x:%02x", array[0], array[1],
-             array[2], array[3], array[4], array[5]);
-    return (const char*)macStr;
-  }
-
   static int bufferAvailableForWrite() {
     return ESPNowStreamSelf->buffer.availableForWrite();
   }
@@ -712,7 +721,7 @@ class ESPNowStream : public BaseStream {
   static void default_recv_cb(const esp_now_recv_info* info,
                               const uint8_t* data, int data_len) {
     const bool broadcast =
-        memcmp(info->des_addr, BROADCAST_MAC, ESP_NOW_ETH_ALEN) == 0;
+        memcmp(info->des_addr, BROADCAST_MAC.data(), ESP_NOW_ETH_ALEN) == 0;
     ESPNowStreamSelf->handle_recv_cb(info->src_addr, data, data_len, broadcast,
                                      info->rx_ctrl->rssi);
   }
@@ -731,7 +740,7 @@ class ESPNowStream : public BaseStream {
     if (first_mac[0] == 0) {
       strncpy((char*)first_mac, (char*)mac_addr, ESP_NOW_KEY_LEN);
     }
-    LOGD("default_send_cb - %s -> %s", this->mac2str(mac_addr),
+    LOGD("default_send_cb - %" MACSTR" -> %s", MAC2STR(mac_addr),
          status == ESP_NOW_SEND_SUCCESS ? "+" : "-");
 
     // ignore others
@@ -745,9 +754,9 @@ class ESPNowStream : public BaseStream {
         last_io_success_time = millis();
       } else {
         LOGI(
-            "Send Error to %s! Status: %d (Possible causes: out of range, "
+            "Send Error to %" MACSTR "! Status: %d (Possible causes: out of range, "
             "receiver busy/offline, channel mismatch, or buffer full)",
-            this->mac2str(mac_addr), status);
+            MAC2STR(mac_addr), status);
       }
 
       // Release semaphore to allow write to check status and retry if needed
