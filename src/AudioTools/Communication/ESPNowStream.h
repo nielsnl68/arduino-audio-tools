@@ -208,7 +208,7 @@ class ESPNowStream : public BaseStream {
     }
     esp_err_t result = esp_now_add_peer(&peer);
     if (result == ESP_OK) {
-      LOGI("addPeer: %" MACSTR, MAC2STR(peer.peer_addr));
+      LOGI("addPeer: " MACSTR, MAC2STR(peer.peer_addr));
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
       esp_now_rate_config_t rate_config = {.phymode = cfg.phymode,
                                            .rate = cfg.rate,
@@ -436,7 +436,7 @@ class ESPNowStream : public BaseStream {
       // checking if address has been updated
       uint8_t addr[6];
       Network.macAddress(addr);
-      LOGI("Internel mac is now : " MACSTR, MAC2STR(addr));
+      LOGI("Internel mac is now: " MACSTR, MAC2STR(addr));
 
       if (memcmp(addr, cfg.own_address.data(), 6) != 0) {
         LOGE("Wrong mac address: " MACSTR, MAC2STR(addr));
@@ -732,15 +732,14 @@ class ESPNowStream : public BaseStream {
   }
 #endif
 
-  virtual void handle_send_cb(const uint8_t* mac_addr,
-                              esp_now_send_status_t status) {
+  virtual void handle_send_cb(const uint8_t* mac_addr, esp_now_send_status_t status) {
     static uint8_t first_mac[ESP_NOW_KEY_LEN] = {0};
     // we use the first confirming mac_addr for further confirmations and
     // ignore others
     if (first_mac[0] == 0) {
       strncpy((char*)first_mac, (char*)mac_addr, ESP_NOW_KEY_LEN);
     }
-    LOGD("default_send_cb - %" MACSTR" -> %s", MAC2STR(mac_addr),
+    LOGD("default_send_cb - " MACSTR " -> %s", MAC2STR(mac_addr),
          status == ESP_NOW_SEND_SUCCESS ? "+" : "-");
 
     // ignore others
@@ -754,7 +753,7 @@ class ESPNowStream : public BaseStream {
         last_io_success_time = millis();
       } else {
         LOGI(
-            "Send Error to %" MACSTR "! Status: %d (Possible causes: out of range, "
+            "Send Error to " MACSTR "! Status: %d (Possible causes: out of range, "
             "receiver busy/offline, channel mismatch, or buffer full)",
             MAC2STR(mac_addr), status);
       }
