@@ -136,117 +136,8 @@ class NowTalkStream : public ESPNowStream {
 
   /// Initialization of ESPNow incl WIFI
   bool begin(NowTalkStreamConfig cfg) {
+    // cfg.oui = 0x307558;
     this->cfg = cfg;
-
-    taskHandler.begin([this]() {
-      NowTalkData msg;
-      std::vector<String> parts;
-
-      if (this->gueue.dequeue(msg)) {
-        switch (msg.opcode) {
-          case NOWTALK_CLIENT_REGISTER:
-          case NOWTALK_ACK:
-          case NOWTALK_NACK:
-            break;
-          case NOWTALK_CLIENT_REMOVE:
-            break;
-
-          case NOWTALK_PING:
-            // do not respond on Ping messages
-            break;
-
-          case NOWTALK_PONG:
-            parts = this->split_((char*)&msg.data);
-            // turn off timeout
-            // this->init_ping_timeout(true);
-            if (parts.size() > 1) {
-              /*
-              std::string date = parts[1];
-              configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-              tm xtm = createTM(date.c_str());
-              setTime(makeTime(xtm))
-              */
-
-              //  ESP_LOGD(TAG, config.timerPing);
-
-              bool isNewMaster = (this->current_server_mac_[0] == 0);
-              if (isNewMaster) {
-                //this->set_current_server_mac((uint8_t*)&packet.mac);
-                if (this->main_server_mac_[0] == 0) {
-                  memcpy(this->main_server_mac_, msg.mac, 6);
-                  this->main_server_name_ = parts[0];
-                  //this->save_configuration();
-                }
-                this->addPeer(msg.mac);
-              }
-            }
-
-            if (this->wakeup_) {
-              this->goto_sleep();
-            }
-            break;
-
-          case NOWTALK_SERVER_REQUEST_DETAILS:
-            if ((this->main_server_name_ != "") && (this->badge_name_ != "")) {
-              ESP_LOGI("Handler", "Detail request from: " MACSTR,
-                       MAC2STR(msg.mac));
-              this->addPeer(msg.mac);
-
-              this->sendPacket(NOWTALK_CLIENT_DETAILS,
-                         this->main_server_access_key_ + "~" +
-                             this->badge_name_ + "~" + badgeID());
-              esp_now_del_peer(msg.mac);
-              return;
-            }
-            break;
-
-          case NOWTALK_SERVER_NEW_ACCESS_KEY:
-            parts = this->split_((char*)&msg.data);
-            if (parts.size() > 1) {
-              String OldIP = parts[0];
-              String NewIP = parts[1];
-              if (this->main_server_access_key_ == OldIP) {
-                this->main_server_access_key_ = NewIP;
-                this->sendPacket(NOWTALK_CLIENT_ACK);
-                ESP_LOGI(TAG, "Update IP to: \n%s",
-                         this->main_server_access_key_.c_str());
-                break;
-              }
-            }
-            break;
-
-          case NOWTALK_SERVER_NEW_BADGE_NAME:
-            parts = this->split_((char*)&msg.data);
-            if (parts.size() > 1) {
-              String OldName = parts[0];
-              String NewName = parts[1];
-              if (this->badge_name_ == OldName) {
-                this->badge_name_ = NewName;  // <- destination's capacity
-                this->sendPacket(NOWTALK_CLIENT_ACK);
-                ESP_LOGI(TAG, "Update Name to: \n%s",
-                         this->badge_name_.c_str());
-                return;
-              }
-            }
-            break;
-          case NOWTALK_STREAM_DATA:
-            // make sure that the receive buffer is available - moved from begin
-            // to make sure that it is only allocated when needed
-            ESPNowStream::handle_recv_cb(msg.mac, msg.data, msg.len,
-                                         msg.isBroadcasted, msg.RSSI);
-
-          default:
-            if (cfg.nowtalk_cb != nullptr) {
-              cfg.nowtalk_cb(msg.mac, msg.opcode, msg.data, msg.len,
-                             msg.isBroadcasted, msg.RSSI);
-            } else {
-              ESP_LOGI(TAG, "Unknown command: " MACSTR " [%02x] %s",
-                       MAC2STR(msg.mac), msg.opcode, msg.data);
-            }
-        }
-        this->send(msg.mac, NOWTALK_CLIENT_NACK);
-      }
-    });
 
     return ESPNowStream::begin((ESPNowStreamConfig)cfg);
   }
@@ -293,6 +184,117 @@ class NowTalkStream : public ESPNowStream {
     }
     return err;
   }
+
+  void loop() {
+      NowTalkData msg;
+      std::vector<String> parts;
+
+      if (this->gueue.dequeue(msg)) {
+        switch (msg.opcode) {
+          case NOWTALK_CLIENT_REGISTER:
+          case NOWTALK_ACK:
+          case NOWTALK_NACK:
+            break;
+          case NOWTALK_CLIENT_REMOVE:
+            break;
+
+          case NOWTALK_PING:
+            // do not respond on Ping messages
+            break;
+
+          case NOWTALK_PONG:
+            parts = this->split_((char*)&msg.data);
+            // turn off timeout
+            // this->init_ping_timeout(true);
+            if (parts.size() > 1) {
+              /*
+              std::string date = parts[1];
+              configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+              tm xtm = createTM(date.c_str());
+              setTime(makeTime(xtm))
+              */
+
+              //  ESP_LOGD(TAG, config.timerPing);
+
+              bool isNewMaster = (this->current_server_mac_[0] == 0);
+              if (isNewMaster) {
+                //this->set_current_server_mac((uint8_t*)&packet.mac);
+                if (this->main_server_mac_[0] == 0) {
+                  memcpy(this->main_server_mac_, msg.mac, 6);
+                  this->main_server_name_ = parts[0];
+                  //this->save_configuration();
+                }
+                this->addPeer((uint8_t *) &(msg.mac));
+              }
+            }
+
+            if (this->wakeup_) {
+              // this->goto_sleep();
+            }
+            break;
+
+          case NOWTALK_SERVER_REQUEST_DETAILS:
+            if ((this->main_server_name_ != "") && (this->badge_name_ != "")) {
+              ESP_LOGI("Handler", "Detail request from: " MACSTR,
+                       MAC2STR(msg.mac));
+              this->addPeer(msg.mac);
+
+              this->sendPacket(NOWTALK_CLIENT_DETAILS,
+                         this->main_server_access_key_ + "~" +
+                             this->badge_name_ + "~" + badgeID());
+              esp_now_del_peer((uint8_t *) &(msg.mac));
+              return;
+            }
+            break;
+
+          case NOWTALK_SERVER_NEW_ACCESS_KEY:
+            parts = this->split_((char*)&msg.data);
+            if (parts.size() > 1) {
+              String OldIP = parts[0];
+              String NewIP = parts[1];
+              if (this->main_server_access_key_ == OldIP) {
+                this->main_server_access_key_ = NewIP;
+                this->sendPacket(NOWTALK_CLIENT_ACK);
+                ESP_LOGI(TAG, "Update IP to: \n%s",
+                         this->main_server_access_key_.c_str());
+                return;
+              }
+            }
+            break;
+
+          case NOWTALK_SERVER_NEW_BADGE_NAME:
+            parts = this->split_((char*)&msg.data);
+            if (parts.size() > 1) {
+              String OldName = parts[0];
+              String NewName = parts[1];
+              if (this->badge_name_ == OldName) {
+                this->badge_name_ = NewName;  // <- destination's capacity
+                this->sendPacket(NOWTALK_CLIENT_ACK);
+                ESP_LOGI(TAG, "Update Name to: \n%s",
+                         this->badge_name_.c_str());
+                return;
+              }
+            }
+            break;
+          case NOWTALK_STREAM_DATA:
+            // make sure that the receive buffer is available - moved from begin
+            // to make sure that it is only allocated when needed
+            ESPNowStream::handle_recv_cb((const uint8_t *) &(msg.mac), msg.data, msg.len,
+                                         msg.isBroadcasted, msg.RSSI);
+
+          default:
+            if (cfg.nowtalk_cb != nullptr) {
+              cfg.nowtalk_cb(const uint8_t *) &(msg.mac), msg.opcode, msg.data, msg.len,
+                             msg.isBroadcasted, msg.RSSI);
+              return;
+            } else {
+              ESP_LOGI(TAG, "Unknown command: " MACSTR " [%02x] %s",
+                       MAC2STR(msg.mac), msg.opcode, msg.data);
+            }
+        }
+        this->senPacket(NOWTALK_CLIENT_NACK);
+      }
+    }
 
  private:
   NowTalkStreamConfig cfg;
