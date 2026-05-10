@@ -295,7 +295,7 @@ class MTSDecoderTSDemux : public AudioDecoder {
            (unsigned long)pes->dts);
       // print out the PES Packet data if it's in our print list
       int i;
-      AudioLogger logger = AudioLogger::instance();
+      AudioLogger logger = AudioToolsLogger();
       for (i = 0; i < MTS_PRINT_PIDS_LEN; ++i) {
         if (print_pids[i] == pid) {
           // log data
@@ -921,7 +921,7 @@ class MTSDecoderTSDemux : public AudioDecoder {
 
   static void *log_malloc(size_t size) {
     void *result = nullptr;
-#if defined(ESP32)
+#if defined(USE_PSRAM)
     result = ps_malloc(size);
     if (result != nullptr) return result;
 #endif
@@ -933,8 +933,8 @@ class MTSDecoderTSDemux : public AudioDecoder {
 
   static void *log_calloc(size_t num, size_t size) {
     void *result = nullptr;
-#if defined(ESP32)
-    result = ps_calloc(num, size);
+#if defined(USE_PSRAM)
+    result = ps_calloc(1, size);
     if (result != nullptr) return result;
 #endif
     result = calloc(num, size);
