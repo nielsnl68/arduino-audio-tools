@@ -55,7 +55,7 @@ class AudioStreamWrapper : public AudioStream {
 
  protected:
   Stream *p_stream;
-  int32_t clientTimeout = URL_CLIENT_TIMEOUT;  // 60000;
+  int32_t clientTimeout = URL_CLIENT_TIMEOUT;  // 10000;
 };
 
 /**
@@ -404,10 +404,16 @@ class GeneratedSoundStream : public AudioStream {
   }
 
   void setInput(SoundGenerator<T> &generator) {
-    this->generator_ptr = &generator;
+    this->p_generator = &generator;
   }
 
-  AudioInfo defaultConfig() { return this->generator_ptr->defaultConfig(); }
+  AudioInfo defaultConfig() {
+    if (p_generator == nullptr) {
+      LOGW("%s", source_not_defined_error);
+      return AudioInfo();
+    }
+    return this->p_generator->defaultConfig();
+  }
 
   void setAudioInfo(AudioInfo newInfo) override {
     if (newInfo.bits_per_sample != sizeof(T) * 8) {
@@ -419,12 +425,12 @@ class GeneratedSoundStream : public AudioStream {
   /// start the processing
   bool begin() override {
     TRACED();
-    if (generator_ptr == nullptr) {
+    if (p_generator == nullptr) {
       LOGE("%s", source_not_defined_error);
       return false;
     }
-    generator_ptr->begin();
-    notifyAudioChange(generator_ptr->audioInfo());
+    p_generator->begin();
+    notifyAudioChange(p_generator->audioInfo());
     active = true;
     return active;
   }
@@ -432,12 +438,12 @@ class GeneratedSoundStream : public AudioStream {
   /// start the processing
   bool begin(AudioInfo cfg) {
     TRACED();
-    if (generator_ptr == nullptr) {
+    if (p_generator == nullptr) {
       LOGE("%s", source_not_defined_error);
       return false;
     }
-    generator_ptr->begin(cfg);
-    notifyAudioChange(generator_ptr->audioInfo());
+    p_generator->begin(cfg);
+    notifyAudioChange(p_generator->audioInfo());
     active = true;
     return active;
   }
@@ -445,11 +451,19 @@ class GeneratedSoundStream : public AudioStream {
   /// stop the processing
   void end() override {
     TRACED();
-    generator_ptr->end();
+    if (p_generator != nullptr) {
+      p_generator->end();
+    }
     active = true;  // legacy support - most sketches do not call begin
   }
 
-  AudioInfo audioInfo() override { return generator_ptr->audioInfo(); }
+  AudioInfo audioInfo() override {
+    if (p_generator == nullptr) {
+      LOGE("%s", source_not_defined_error);
+      return AudioStream::audioInfo();
+    }
+    return p_generator->audioInfo();
+  }
 
   /// This is unbounded so we just return the buffer size
   virtual int available() override { return active ? buffer_size : 0; }
@@ -457,11 +471,17 @@ class GeneratedSoundStream : public AudioStream {
   /// privide the data as byte stream
   size_t readBytes(uint8_t *data, size_t len) override {
     if (!active) return 0;
+    if (p_generator == nullptr) {
+      return 0;
+    }
     LOGD("GeneratedSoundStream::readBytes: %u", (unsigned int)len);
-    return generator_ptr->readBytes(data, len);
+    return p_generator->readBytes(data, len);
   }
 
-  bool isActive() { return active && generator_ptr->isActive(); }
+  bool isActive() { 
+    if (p_generator == nullptr) return false;
+    return active && p_generator->isActive(); 
+  }
 
   operator bool() override { return isActive(); }
 
@@ -472,7 +492,7 @@ class GeneratedSoundStream : public AudioStream {
 
  protected:
   bool active = true;  // support for legacy sketches
-  SoundGenerator<T> *generator_ptr;
+  SoundGenerator<T> *p_generator = nullptr;
   int buffer_size =
       DEFAULT_BUFFER_SIZE * 100;  // there is no reason to limit this
   const char *source_not_defined_error = "Source not defined";
@@ -1172,7 +1192,7 @@ class Throttle : public ModifyingStream {
  * @copyright GPLv3
  */
 
-template <typename T>
+template <typename T=int16_t, typename SumT=int>
 class InputMixer : public AudioStream {
  public:
   InputMixer() = default;
@@ -1181,7 +1201,7 @@ class InputMixer : public AudioStream {
   int add(Stream &in, int weight = 100) {
     streams.push_back(&in);
     weights.push_back(weight);
-    total_weights += weight;
+    recalculateWeights();
     return streams.indexOf(&in);
   }
 
@@ -1219,6 +1239,7 @@ class InputMixer : public AudioStream {
   void end() override {
     streams.clear();
     weights.clear();
+    gains.clear();
     result_vect.clear();
     current_vect.clear();
     total_weights = 0.0;
@@ -1242,7 +1263,7 @@ class InputMixer : public AudioStream {
 
     if (len > 0) {
       // result_len must be full frames
-      result_len = len * frame_size / frame_size;
+      result_len = (len / frame_size) * frame_size;;
       // replace sample based with vector based implementation
       // readBytesSamples((T*)data, result_len));
       result_len = readBytesVector((T *)data, result_len);
@@ -1305,11 +1326,12 @@ class InputMixer : public AudioStream {
  protected:
   Vector<Stream *> streams{0};
   Vector<int> weights{0};
+  Vector<float> gains{0};
   int total_weights = 0;
   int frame_size = 4;
   bool limit_available_data = false;
   int retry_count = 5;
-  Vector<int> result_vect;
+  Vector<SumT> result_vect;
   Vector<T> current_vect;
 
   /// Recalculate the weights
@@ -1319,26 +1341,26 @@ class InputMixer : public AudioStream {
       total += weights[j];
     }
     total_weights = total;
+    gains.resize(weights.size());
+    for (int j = 0; j < weights.size(); j++) {
+      gains[j] = total_weights == 0 ? 0.0f : static_cast<float>(weights[j]) / total_weights;
+    }
   }
 
   /// mixing using a vector of samples
   int readBytesVector(T *p_data, int byteCount) {
     int samples = byteCount / sizeof(T);
-    result_vect.resize(samples);
-    current_vect.resize(samples);
+    if (result_vect.size() < samples) result_vect.resize(samples);
+    if (current_vect.size() < samples) current_vect.resize(samples);
     int stream_count = size();
-    resultClear();
+    resultClear(samples);
     int samples_eff_max = 0;
     for (int j = 0; j < stream_count; j++) {
       if (weights[j] > 0) {
         int samples_eff =
             readSamples(streams[j], current_vect.data(), samples, retry_count);
         if (samples_eff > samples_eff_max) samples_eff_max = samples_eff;
-        // if all weights are 0.0 we stop to output
-        float factor = total_weights == 0.0f
-                           ? 0.0f
-                           : static_cast<float>(weights[j]) / total_weights;
-        resultAdd(factor);
+        resultAdd(gains[j], samples_eff);
       }
     }
     // copy result
@@ -1357,15 +1379,15 @@ class InputMixer : public AudioStream {
     return result;
   }
 
-  void resultAdd(float fact) {
-    for (int j = 0; j < current_vect.size(); j++) {
-      current_vect[j] *= fact;
-      result_vect[j] += current_vect[j];
+  void resultAdd(float fact, int samples_eff) {
+    // only accumulate samples that were actually read; tail is already zeroed
+    for (int j = 0; j < samples_eff; j++) {
+      result_vect[j] += static_cast<SumT>(current_vect[j] * fact);
     }
   }
 
-  void resultClear() {
-    memset(result_vect.data(), 0, sizeof(int) * result_vect.size());
+  void resultClear(int samples) {
+    memset(result_vect.data(), 0, sizeof(SumT) * samples);
   }
 };
 
