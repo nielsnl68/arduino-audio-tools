@@ -3,13 +3,22 @@ cmake_minimum_required(VERSION 3.16)
 if (DEFINED ESP_PLATFORM)
 
     # idf component
+    # Determine optional arduino-esp32 dependency 
+    if(TARGET arduino-esp32::arduino-esp32)
+        set(ARDUINO_REQUIRES arduino-esp32)
+    else()
+        set(ARDUINO_REQUIRES "")
+    endif()
+
+
     idf_component_register(
         # SRC_DIRS src
         INCLUDE_DIRS src 
-        REQUIRES bt esp_common freertos hal log nvs_flash driver esp_adc esp_http_client
+        # esp_driver_gpio, esp_driver_i2s, esp_driver_dac needed starting idf v6.0.0
+        REQUIRES esp_common freertos hal log nvs_flash driver esp_adc esp_http_client esp_driver_gpio esp_driver_ledc ${ARDUINO_REQUIRES}
     )
 
-    target_compile_options(${COMPONENT_LIB} INTERFACE -DESP32_CMAKE=1 -Wno-error -Wno-format -fpermissive)
+    target_compile_options(${COMPONENT_LIB} INTERFACE -DESP32_CMAKE=1 -Wno-format )
 
 else()
 
@@ -22,6 +31,7 @@ else()
     include(FetchContent)
 
     add_library(arduino-audio-tools INTERFACE)
+    target_compile_options(arduino-audio-tools INTERFACE  -Wno-format )
 
     option(BUILD_SHARED_LIBS "Build using shared libraries" OFF)
     option(ADD_PORTAUDIO "Add Portaudio Library" OFF)
@@ -30,6 +40,7 @@ else()
 
     # make include directory available to calling projects 
     target_include_directories (arduino-audio-tools INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_options(arduino-audio-tools INTERFACE  -Wno-format)
 
     # installation of all header files
     install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/" # source directory

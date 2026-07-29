@@ -1,5 +1,9 @@
 #pragma once
 
+# ifdef ARDUINO
+#  include "esp32-hal-log.h"
+# endif
+
 //-------ESP32---------
 #if defined(ESP32)  && defined(CONFIG_IDF_TARGET_ESP32)
 // the regular ESP32
@@ -10,6 +14,14 @@
 #  define ESP32X
 #endif
 #if defined(ESP32)  && defined(CONFIG_IDF_TARGET_ESP32S3)
+#  define ESP32S3
+#  define ESP32X
+#  define USE_TDM
+#  define USE_PDM
+#  define USE_PDM_RX
+#endif
+#if defined(ESP32)  && defined(CONFIG_IDF_TARGET_ESP32S31)
+#  define ESP32S31
 #  define ESP32S3
 #  define ESP32X
 #  define USE_TDM
@@ -51,10 +63,12 @@
 #  define USE_LEGACY_I2S (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0))
 #endif
 
+
 //-------Config for ESP32 families ---------
 #if defined(ESP32)
 #  define USE_PSRAM
 #  define USE_STRTOD
+//#  define USE_INITIALIZER_LIST
 // We need to use accept instead of available
 #  if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0) 
 #    define USE_SERVER_ACCEPT true              
@@ -91,15 +105,15 @@
 #define USE_PDM_RX
 
 #ifdef ARDUINO
-#  define USE_PWM
 #  define USE_WIFI
 #  define USE_WIFI_CLIENT_SECURE
 #  define USE_URL_ARDUINO
 #  define USE_AUDIO_SERVER
-#  define USE_TIMER
 #  define USE_TOUCH_READ
 #endif
 
+#define USE_PWM
+#define USE_TIMER
 #define USE_TYPETRAITS
 #define USE_STREAM_WRITE_OVERRIDE
 #define USE_STREAM_READ_OVERRIDE
@@ -154,9 +168,6 @@ typedef uint32_t eps32_i2s_sample_rate_type;
 //-------ESP32C3, ESP32S3, ESP32S2---------
 
 #if defined(ESP32X) 
-# ifdef ARDUINO
-#  include "esp32-hal-log.h"
-# endif
 # if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(5, 0 , 0)
 #  define USE_INT24_FROM_INT
 #  define USE_ANALOG
@@ -174,7 +185,6 @@ typedef uint32_t eps32_i2s_sample_rate_type;
 #define USE_STREAM_READ_OVERRIDE
 // support for psram -> set to true
 #define USE_ALLOCATOR true
-//#define USE_INITIALIZER_LIST
 
 #define PWM_FREQENCY 30000
 #define PIN_PWM_START 1

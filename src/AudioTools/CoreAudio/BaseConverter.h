@@ -1,4 +1,5 @@
 #pragma once
+#include "AudioToolsConfig.h"
 #include "AudioFilter/Filter.h"
 #include "AudioTools/CoreAudio/AudioBasic/Collections.h"
 #include "AudioTypes.h"
@@ -1692,36 +1693,28 @@ class ConverterNChannels : public BaseConverter {
   /// Default Constructor
   ConverterNChannels(int channels) {
     this->channels = channels;
-    filters = new Filter<FT> *[channels];
-    // make sure that we have 1 filter per channel
+    filters.resize(channels);
     for (int j = 0; j < channels; j++) {
       filters[j] = nullptr;
     }
   }
 
-  /// Destructor
-  ~ConverterNChannels() {
-    for (int j = 0; j < channels; j++) {
-      if (filters[j] != nullptr) {
-        delete filters[j];
-      }
-    }
-    delete[] filters;
-    filters = 0;
-  }
-
   /// defines the filter for an individual channel - the first channel is 0
   void setFilter(int channel, Filter<FT> *filter) {
     if (channel < channels) {
-      if (filters[channel] != nullptr) {
-        delete filters[channel];
-      }
       filters[channel] = filter;
     } else {
       LOGE("Invalid channel nummber %d - max channel is %d", channel,
            channels - 1);
     }
   }
+
+  /// returns the filter for the indicated channel
+  Filter<FT> *getFilter(int channel) {
+    if (channel < channels) return filters[channel];
+    return nullptr;
+  }
+
 
   // convert all samples for each channel separately
   size_t convert(uint8_t *src, size_t size) {
@@ -1740,9 +1733,22 @@ class ConverterNChannels : public BaseConverter {
 
   int getChannels() { return channels; }
 
+  /// dynamically change the number of channels; existing filters for valid
+  /// indices are preserved, new slots are initialized to nullptr
+  void setChannels(int newChannels) {
+    if (newChannels == channels) return;
+    int oldChannels = channels;
+    channels = newChannels;
+    filters.resize(newChannels);
+    // initialize new slots
+    for (int j = oldChannels; j < newChannels; j++) {
+      filters[j] = nullptr;
+    }
+  }
+
  protected:
-  Filter<FT> **filters = nullptr;
-  int channels;
+  Vector<Filter<FT> *> filters;
+  int channels = 0;
 };
 
 /**
@@ -1998,6 +2004,24 @@ class CopyChannels : public BaseConverter {
 };
 
 /**
+ * @brief Inverts the signal (multiplies every sample by -1)
+ * @ingroup convert
+ * @tparam T
+ */
+template <typename T = int16_t>
+class ConverterInvert : public BaseConverter {
+ public:
+  size_t convert(uint8_t *src, size_t size) override {
+    T *data = (T *)src;
+    int samples = size / sizeof(T);
+    for (int j = 0; j < samples; j++) {
+      data[j] = -data[j];
+    }
+    return size;
+  }
+};
+
+/**
  * @brief You can provide a lambda expression to convert the data
  * @ingroup convert
  * @tparam T
@@ -2005,12 +2029,21 @@ class CopyChannels : public BaseConverter {
 template <typename T = int16_t>
 class CallbackConverterT : public BaseConverter {
  public:
+  CallbackConverterT() = default;
   CallbackConverterT(T (*callback)(T in, int channel), int channels = 2) {
+    setCallback(callback, channels);
+  }
+
+  void setCallback(T (*callback)(T in, int channel), int channels) {
     this->callback = callback;
     this->channels = channels;
   }
 
   size_t convert(uint8_t *src, size_t size) {
+    // no conversion if no callback is provided
+    if (callback == nullptr) {
+      return size;
+    }
     int samples = size / sizeof(T);
     T *srcT = (T *)src;
     for (int j = 0; j < samples; j++) {
@@ -2020,8 +2053,11 @@ class CallbackConverterT : public BaseConverter {
   }
 
  protected:
-  T (*callback)(T in, int channel);
-  int channels;
+  T (*callback)(T in, int channel) = nullptr;
+  int channels = 2;
 };
+
+/// CallbackConverter with int16_t as default type
+using CallbackConverter = CallbackConverterT<int16_t>;
 
 }  // namespace audio_tools

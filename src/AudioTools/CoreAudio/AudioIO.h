@@ -1,6 +1,7 @@
 #pragma once
 #include "AudioTools/CoreAudio/AudioOutput.h"
 #include "AudioTools/CoreAudio/AudioStreams.h"
+#include "AudioTools/Communication/HTTP/AudioClient.h"  // for Client
 
 #ifndef MAX_ZERO_READ_COUNT
 #define MAX_ZERO_READ_COUNT 3
@@ -28,6 +29,9 @@ class TransformationReader {
   void begin(T* transform, Stream* source) {
     TRACED();
     active = true;
+    is_eof = false;
+    total_bytes_read = 0;
+    last_setup_buffer_size = 0;
     p_stream = source;
     p_transform = transform;
     if (transform == nullptr) {
@@ -38,14 +42,6 @@ class TransformationReader {
       LOGE("p_stream is NULL");
       active = false;
     }
-  }
-
-  /// Defines the read buffer size for individual reads
-  void resizeReadBuffer(int size) { buffer.resize(size); }
-  /// Defines the queue size for result
-  void resizeResultQueue(int size) {
-    result_queue_buffer.resize(size);
-    result_queue.begin();
   }
 
   size_t readBytes(uint8_t* data, size_t len) {
@@ -59,11 +55,105 @@ class TransformationReader {
       return 0;
     }
 
+    setupBuffers(len);
+
+    if (!is_eof) {
+      fillResultQueue(len);
+    }
+
+    int result_len = min((int)len, result_queue.available());
+    result_len = result_queue.readBytes(data, result_len);
+    LOGD("TransformationReader::readBytes: %d -> %d", (int)len, result_len);
+    total_bytes_read += result_len;
+    return result_len;
+  }
+
+  /// Fills the internal queue up to at least DEFAULT_BUFFER_SIZE bytes (if possible) and
+  /// reports the currently available queue size limited by max_read_size.
+  int available() {
+    if (!active || p_stream == nullptr || p_transform == nullptr) return 0;
+    if (is_eof) return result_queue.available();
+    setupBuffers(max_read_size);
+    fillResultQueue(max_read_size);
+    int available_bytes = result_queue.available();
+    LOGD("TransformationReader::available: %d", available_bytes);
+    return available_bytes > max_read_size ? max_read_size : available_bytes;
+  }
+
+  void end() {
+    result_queue_buffer.resize(0);
+    buffer.resize(0);
+    total_bytes_read = 0;
+    active = false;
+  }
+
+  /// Defines the queue size dependent on the read size
+  void setResultQueueFactor(int factor) { result_queue_factor = factor; }
+
+  /// Defines the queue size for result
+  void resizeResultQueue(int size) {
+    result_queue_buffer.resize(size);
+    result_queue.begin();
+  }
+
+  void setMaxReadSize(int size) { max_read_size = size; }
+
+  size_t getTotalBytesRead() const { return total_bytes_read; }
+
+  /// Defines how a run of MAX_ZERO_READ_COUNT consecutive empty reads from
+  /// the source is interpreted:
+  /// - true (default): the source is treated as finished (e.g. end of file)
+  ///   and is_eof latches permanently - matches the historical behavior for
+  ///   decoders/encoders reading a finite stream.
+  /// - false: the source is treated as a live/continuous producer that is
+  ///   just momentarily empty (a buffer underflow). is_eof is never set, so
+  ///   the next call simply tries again once more data has arrived.
+  void setEofOnZeroReads(bool flag) { eof_on_zero_reads = flag; }
+
+ protected:
+  RingBuffer<uint8_t> result_queue_buffer{0};
+  QueueStream<uint8_t> result_queue{result_queue_buffer};  //
+  Stream* p_stream = nullptr;
+  Vector<uint8_t> buffer{0};  // we allocate memory only when needed
+  T* p_transform = nullptr;
+  bool active = false;
+  int result_queue_factor = 5;
+  int max_read_size = DEFAULT_BUFFER_SIZE;
+  int last_setup_buffer_size = 0;
+  float last_byte_factor = 0.0f;
+  bool is_eof = false;
+  bool eof_on_zero_reads = true;
+  size_t total_bytes_read = 0;
+
+  /// Defines the read buffer size for individual reads
+  void resizeReadBuffer(int size) { buffer.resize(size); }
+
+  void setupBuffers(size_t len) {
+    float byte_factor = p_transform->getByteFactor();
+    if (byte_factor <= 0.0f) {
+      LOGE("Invalid byte factor: %f", byte_factor);
+      byte_factor = 1.0f;
+    }
+    // Recompute if the requested length changed, or if the transform's byte
+    // factor drifted meaningfully since the read chunk size was last sized
+    // (e.g. a live-adjusted resampling step size). For a transform with a
+    // constant byte factor (the common decoder/encoder case) this check
+    // never re-triggers after the first call, so behavior there is
+    // unchanged; it only matters for transforms whose byte factor changes
+    // at runtime, where a stale chunk size would otherwise silently distort
+    // the consumption/production ratio.
+    bool byte_factor_changed =
+        fabsf(byte_factor - last_byte_factor) > 0.01f * last_byte_factor;
+    if (len == last_setup_buffer_size && !byte_factor_changed) return;
+    LOGD("setupBuffers: %d", (int)len);
+    last_byte_factor = byte_factor;
+
     // we read half the necessary bytes
-    if (buffer.size() == 0) {
-      int size = (0.5f / p_transform->getByteFactor() * len);
-      // process full samples/frames
-      size = size / 4 * 4;
+    int size = (0.5f / byte_factor * len);
+    // process full samples/frames
+    size = size / 4 * 4;
+    if (size <= 0) size = 4;
+    if (buffer.size() < size) {
       LOGI("read size: %d", size);
       buffer.resize(size);
     }
@@ -75,56 +165,71 @@ class TransformationReader {
       result_queue_buffer.resize(rb_size);
       result_queue.begin();
     }
+    last_setup_buffer_size = len;
+  }
 
-    if (result_queue.available() < len) {
-      Print* tmp = setupOutput();
-      int zero_count = 0;
-      while (result_queue.available() < len) {
-        int read_eff = p_stream->readBytes(buffer.data(), buffer.size());
-        if (read_eff > 0) {
-          zero_count = 0;  // reset 0 count
-          if (read_eff != buffer.size()) {
-            LOGD("readBytes %d -> %d", buffer.size(), read_eff);
-          }
-          int write_eff = p_transform->write(buffer.data(), read_eff);
-          if (write_eff != read_eff) {
-            LOGE("TransformationReader::write %d -> %d", read_eff, write_eff);
-          }
-        } else {
-          // limit the number of reads which provide 0;
-          if (++zero_count > MAX_ZERO_READ_COUNT) {
-            break;
-          }
-          // wait for some more data
-          delay(5);
-        }
-      }
-      restoreOutput(tmp);
+  /// Fills the result queue until at least len bytes are available or no more
+  /// input data arrives.
+  void fillResultQueue(size_t len) {
+    if (is_eof) return;
+    if (result_queue.available() >= len) return;
+    LOGD("fillResultQueue: %d", (int)len);
+
+    // Detect misconfigured buffer: if the ring buffer capacity is smaller than
+    // the requested len bytes we can never satisfy the condition and will loop
+    // forever. Issue an error and bail out early.
+    if ((int)len > result_queue_buffer.size()) {
+      LOGE("fillResultQueue: result_queue_buffer too small: %d < %d. "
+           "Increase result_queue_factor or call resizeReadResultQueue().",
+           result_queue_buffer.size(), (int)len);
+      return;
     }
 
-    int result_len = min((int)len, result_queue.available());
-    result_len = result_queue.readBytes(data, result_len);
-    LOGD("TransformationReader::readBytes: %d -> %d", (int)len, result_len);
-
-    return result_len;
+    Print* tmp = setupOutput();
+    int zero_count = 0;
+    while (result_queue.available() < len) {
+      // Detect buffer-full stall: if we can't write any more data but the
+      // queue is still below len, we must stop to avoid an endless loop.
+      if (result_queue.available() >= result_queue_buffer.size()) {
+        LOGE("fillResultQueue: result_queue full (%d) but target not reached "
+             "(%d/%d). Increase result_queue_factor or call "
+             "resizeReadResultQueue().",
+             result_queue_buffer.size(), result_queue.available(), (int)len);
+        break;
+      }
+      int read_size = buffer.size();
+      int read_eff = p_stream->readBytes(buffer.data(), read_size);
+      LOGD("readBytes from source: %d -> %d", read_size,read_eff);
+      if (read_eff > 0) {
+        zero_count = 0;  // reset 0 count
+        if (read_eff != buffer.size()) {
+          LOGD("readBytes %d -> %d", buffer.size(), read_eff);
+        }
+        int write_eff = p_transform->write(buffer.data(), read_eff);
+        if (write_eff != read_eff) {
+          LOGE("TransformationReader::write %d -> %d", read_eff, write_eff);
+        }
+      } else {
+        // limit the number of reads which provide 0;
+        if (++zero_count > MAX_ZERO_READ_COUNT) {
+          if (eof_on_zero_reads) {
+            is_eof = true;
+            // Flush any buffered/final encoder bytes into result_queue.
+            p_transform->flush();
+          }
+          // Otherwise the source is just a momentarily empty live
+          // producer (buffer underflow, not end of stream): stop trying
+          // for this call, but leave is_eof false so the next call
+          // retries once more data has arrived.
+          break;
+        }
+        // wait for some more data
+        delay(5);
+      }
+    }
+    LOGD("fillResultQueue available: %d", result_queue.available());
+    restoreOutput(tmp);
   }
-
-  void end() {
-    result_queue_buffer.resize(0);
-    buffer.resize(0);
-  }
-
-  /// Defines the queue size dependent on the read size
-  void setResultQueueFactor(int factor) { result_queue_factor = factor; }
-
- protected:
-  RingBuffer<uint8_t> result_queue_buffer{0};
-  QueueStream<uint8_t> result_queue{result_queue_buffer};  //
-  Stream* p_stream = nullptr;
-  Vector<uint8_t> buffer{0};  // we allocate memory only when needed
-  T* p_transform = nullptr;
-  bool active = false;
-  int result_queue_factor = 5;
 
   /// Makes sure that the data  is written to the array
   /// @param data
@@ -185,7 +290,7 @@ class ReformatBaseStream : public ModifyingStream {
   }
 
   int available() override {
-    return DEFAULT_BUFFER_SIZE;  // reader.availableForWrite();
+    return reader.available();
   }
 
   int availableForWrite() override {
@@ -193,6 +298,13 @@ class ReformatBaseStream : public ModifyingStream {
   }
 
   virtual float getByteFactor() = 0;
+
+  /// Called by TransformationReader when EOF is detected on the source stream.
+  /// Override in subclasses to flush any internally buffered encoder/decoder
+  /// data into the current output (which at that point is the result_queue).
+  /// Do NOT call the full end()/begin() cycle here – that would destroy the
+  /// reader's own buffers and reset the is_eof flag.
+  virtual void flush() {}
 
   void end() override {
     TRACED();
@@ -204,10 +316,17 @@ class ReformatBaseStream : public ModifyingStream {
   /// transformationReader().resizeResultQueue(size)
   void resizeReadResultQueue(int size) { reader.resizeResultQueue(size); }
 
+  /// same as resizeReadResultQueue(size)
+  void setReadResultQueueSize(int size) { reader.resizeResultQueue(size); }
+
+  /// Defines the read buffer size for individual reads: same as transformationReader().setMaxReadSize(size)
+  void setMaxReadSize(int size) { reader.setMaxReadSize(size); }
+
   /// Provides access to the TransformationReader
   virtual TransformationReader<ReformatBaseStream>& transformationReader() {
     return reader;
   }
+
 
  protected:
   TransformationReader<ReformatBaseStream> reader;
@@ -358,34 +477,50 @@ class MultiOutput : public ModifyingOutput {
   virtual ~MultiOutput() { clear(); }
 
   /// Add an additional AudioOutput output
-  void add(AudioOutput& out) { vector.push_back(&out); }
+  void add(AudioOutput& out) {
+    vector.push_back({&out, &out, Kind::AudioOutputKind});
+  }
 
   /// Add an AudioStream to the output
   void add(AudioStream& stream) {
-    AdapterAudioStreamToAudioOutput* out =
-        new AdapterAudioStreamToAudioOutput(stream);
-    vector.push_back(out);
+    vector.push_back({&stream, &stream, Kind::AudioStreamKind});
   }
 
-  void add(Print& print) {
-    AdapterPrintToAudioOutput* out = new AdapterPrintToAudioOutput(print);
-    vector.push_back(out);
+  /// Add a (network) Client as output: e.g. WiFiClient, EthernetClient...
+  void add(Client& client) {
+    vector.push_back({&client, nullptr, Kind::ClientKind});
+  }
+
+  /// Add a generic Print output: Warning no support for AudioInfo
+  /// notifications. It is recommended to use one of the other add() methods.
+  void add(Print& print) { vector.push_back({&print, nullptr, Kind::PrintKind}); }
+
+  /// Removes the indicated output
+  void remove(Print& print) {
+    for (int j = 0; j < vector.size(); j++) {
+      if (vector[j].print == &print) {
+        vector.erase(j);
+        return;
+      }
+    }
   }
 
   void flush() {
     for (int j = 0; j < vector.size(); j++) {
-      vector[j]->flush();
+      vector[j].print->flush();
     }
   }
 
   void setAudioInfo(AudioInfo info) {
     for (int j = 0; j < vector.size(); j++) {
-      vector[j]->setAudioInfo(info);
+      if (vector[j].info != nullptr) {
+        vector[j].info->setAudioInfo(info);
+      }
     }
   }
 
   size_t write(const uint8_t* data, size_t len) override {
-    for (auto& out : vector) {
+    for (auto& rec : vector) {
       int open = len;
       int start = 0;
       // create copy of data to avoid that one output changes the data for the
@@ -393,7 +528,7 @@ class MultiOutput : public ModifyingOutput {
       uint8_t copy[len];
       memcpy(copy, data, len);
       while (open > 0) {
-        int written = out->write(copy + start, open);
+        int written = rec.print->write(copy + start, open);
         open -= written;
         start += written;
       }
@@ -405,24 +540,66 @@ class MultiOutput : public ModifyingOutput {
     for (int j = 0; j < vector.size(); j++) {
       int open = 1;
       while (open > 0) {
-        open -= vector[j]->write(ch);
+        open -= vector[j].print->write(ch);
       }
     }
     return 1;
   }
 
-  /// Removes all output components
-  void clear() {
-    for (auto& tmp : vector) {
-      if (tmp != nullptr && tmp->isDeletable()) {
-        delete tmp;
+  /// Removes all output components: the referenced Print/AudioOutput/
+  /// AudioStream/Client objects are never owned by MultiOutput, so no
+  /// memory needs to be released here.
+  void clear() { vector.clear(); }
+
+  /// Removes all outputs which are no longer active. Client, AudioStream and
+  /// AudioOutput provide an operator bool() which is used to determine if the
+  /// output is still active; plain Print outputs cannot be checked and are
+  /// always kept.
+  void clearInactive() {
+    for (int j = vector.size() - 1; j >= 0; j--) {
+      if (!isActive(vector[j])) {
+        vector.erase(j);
       }
     }
-    vector.clear();
   }
 
  protected:
-  Vector<AudioOutput*> vector;
+  /// Identifies the actual type behind the stored Print pointer so that
+  /// clearInactive() can safely static_cast back to call operator bool()
+  enum class Kind { PrintKind, ClientKind, AudioStreamKind, AudioOutputKind };
+
+  /// Record describing a single replicated output
+  struct MultiOutputRecord {
+    /// Target to which the data is actually written
+    Print* print;
+    /// Optional AudioInfoSupport interface: only set when the added object
+    /// also supports AudioInfo notifications (AudioOutput, AudioStream)
+    AudioInfoSupport* info;
+    /// Actual type of the object behind print
+    Kind kind;
+
+    MultiOutputRecord(Print* print = nullptr, AudioInfoSupport* info = nullptr,
+                       Kind kind = Kind::PrintKind)
+        : print(print), info(info), kind(kind) {}
+  };
+
+  Vector<MultiOutputRecord> vector;
+
+  /// Determines if the output is still active: Client, AudioStream and
+  /// AudioOutput support this via their operator bool(); plain Print
+  /// outputs cannot be checked and are always reported as active.
+  bool isActive(MultiOutputRecord& rec) {
+    switch (rec.kind) {
+      case Kind::ClientKind:
+        return (bool)*static_cast<Client*>(rec.print);
+      case Kind::AudioStreamKind:
+        return (bool)*static_cast<AudioStream*>(rec.print);
+      case Kind::AudioOutputKind:
+        return (bool)*static_cast<AudioOutput*>(rec.print);
+      default:
+        return true;
+    }
+  }
 
   /// support for Pipleline
   void setOutput(Print& out) { add(out); }

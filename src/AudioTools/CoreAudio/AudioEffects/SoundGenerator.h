@@ -31,11 +31,13 @@ class SoundGenerator {
 
   virtual ~SoundGenerator() { end(); }
 
+  /// Starts the processing with the provided AudioInfo
   virtual bool begin(AudioInfo info) {
     this->info = info;
     return begin();
   }
 
+  /// Starts the processing 
   virtual bool begin() {
     TRACED();
     active = true;
@@ -48,11 +50,10 @@ class SoundGenerator {
     return true;
   }
 
-  /// ends the processing
+  /// Ends the processing
   virtual void end() { active = false; }
 
-  /// Checks if the begin method has been called - after end() isActive returns
-  /// false
+  /// Checks if the begin method has been called - after end() isActive is false
   virtual bool isActive() { return active; }
 
   /// Provides a single sample
@@ -95,6 +96,7 @@ class SoundGenerator {
     recalculatePlayTime();
   }
 
+  /// Defines the play time in ms and the ramp up and ramp down time in percent
   void setPlayTime(uint32_t playMs, uint8_t upPercent = 20,
                    uint8_t downPercent = 30) {
     LOGI("setPlayTime: playMs=%d, upPercent=%d, downPercent=%d", playMs,
@@ -208,21 +210,21 @@ class SoundGenerator {
 };
 
 /**
- * @brief Generates a Sound with the help of sin() function. If you plan to
- * change the amplitude or frequency (incrementally), I suggest to use
- * SineFromTable instead.
+ * @brief Generates a Sound with the help of sin() function. 
+ * If performance is of concern, I suggest to use theSineFromTable
+ * or the FastSineGenerator.
  * @ingroup generator
  * @author Phil Schatzmann
  * @copyright GPLv3
  *
  */
 template <class T = int16_t>
-class SineWaveGenerator : public SoundGenerator<T> {
+class SineGenerator : public SoundGenerator<T> {
  public:
   // the scale defines the max value which is generated
-  SineWaveGenerator(float amplitude = 0.9f * NumberConverter::maxValueT<T>(),
+  SineGenerator(float amplitude = NumberConverter::maxValueT<T>(),
                     float phase = 0.0f) {
-    LOGD("SineWaveGenerator");
+    LOGD("SineGenerator");
     m_amplitude = amplitude;
     m_phase = phase;
   }
@@ -235,7 +237,7 @@ class SineWaveGenerator : public SoundGenerator<T> {
   }
 
   bool begin(AudioInfo info) override {
-    LOGI("%s::begin(channels=%d, sample_rate=%d)", "SineWaveGenerator",
+    LOGI("%s::begin(channels=%d, sample_rate=%d)", "SineGenerator",
          (int)info.channels, (int)info.sample_rate);
     SoundGenerator<T>::begin(info);
     this->m_deltaTime = 1.0f / SoundGenerator<T>::info.sample_rate;
@@ -244,7 +246,7 @@ class SineWaveGenerator : public SoundGenerator<T> {
 
   bool begin(AudioInfo info, float frequency) {
     LOGI("%s::begin(channels=%d, sample_rate=%d, frequency=%.2f)",
-         "SineWaveGenerator", (int)info.channels, (int)info.sample_rate,
+         "SineGenerator", (int)info.channels, (int)info.sample_rate,
          frequency);
     SoundGenerator<T>::begin(info);
     this->m_deltaTime = 1.0f / SoundGenerator<T>::info.sample_rate;
@@ -309,6 +311,10 @@ class SineWaveGenerator : public SoundGenerator<T> {
   }
 };
 
+/// Alias for SineWaveGenerator
+template <class T = int16_t>  
+using SineWaveGenerator = SineGenerator<T>;
+
 /**
  * @brief Sine wave which is based on a fast approximation function.
  * @ingroup generator
@@ -317,21 +323,21 @@ class SineWaveGenerator : public SoundGenerator<T> {
  * @tparam T
  */
 template <class T = int16_t>
-class FastSineGenerator : public SineWaveGenerator<T> {
+class FastSineGenerator : public SineGenerator<T> {
  public:
-  FastSineGenerator(float amplitude = 32767.0, float phase = 0.0)
-      : SineWaveGenerator<T>(amplitude, phase) {
+  FastSineGenerator(float amplitude = NumberConverter::maxValueT<T>(), float phase = 0.0)
+      : SineGenerator<T>(amplitude, phase) {
     LOGD("FastSineGenerator");
   }
 
   virtual T readSample() override {
     float angle =
-        SineWaveGenerator<T>::m_cycles + SineWaveGenerator<T>::m_phase;
-    T result = SineWaveGenerator<T>::m_amplitude * sine(angle);
-    SineWaveGenerator<T>::m_cycles +=
-        SineWaveGenerator<T>::m_frequency * SineWaveGenerator<T>::m_deltaTime;
-    if (SineWaveGenerator<T>::m_cycles > 1.0f) {
-      SineWaveGenerator<T>::m_cycles -= 1.0f;
+        SineGenerator<T>::m_cycles + SineGenerator<T>::m_phase;
+    T result = SineGenerator<T>::m_amplitude * sine(angle);
+    SineGenerator<T>::m_cycles +=
+        SineGenerator<T>::m_frequency * SineGenerator<T>::m_deltaTime;
+    if (SineGenerator<T>::m_cycles > 1.0f) {
+      SineGenerator<T>::m_cycles -= 1.0f;
     }
     return result;
   }
@@ -355,7 +361,7 @@ class FastSineGenerator : public SineWaveGenerator<T> {
 template <class T = int16_t>
 class SquareWaveGenerator : public FastSineGenerator<T> {
  public:
-  SquareWaveGenerator(float amplitude = 32767.0f, float phase = 0.0f)
+  SquareWaveGenerator(float amplitude = NumberConverter::maxValueT<T>(), float phase = 0.0f)
       : FastSineGenerator<T>(amplitude, phase) {
     LOGD("SquareWaveGenerator");
   }
@@ -380,21 +386,21 @@ class SquareWaveGenerator : public FastSineGenerator<T> {
  * @tparam T
  */
 template <class T = int16_t>
-class SawToothGenerator : public SineWaveGenerator<T> {
+class SawToothGenerator : public SineGenerator<T> {
  public:
-  SawToothGenerator(float amplitude = 32767.0, float phase = 0.0)
-      : SineWaveGenerator<T>(amplitude, phase) {
+  SawToothGenerator(float amplitude = NumberConverter::maxValueT<T>(), float phase = 0.0)
+      : SineGenerator<T>(amplitude, phase) {
     LOGD("SawToothGenerator");
   }
 
   virtual T readSample() override {
     float angle =
-        SineWaveGenerator<T>::m_cycles + SineWaveGenerator<T>::m_phase;
-    T result = SineWaveGenerator<T>::m_amplitude * saw(angle);
-    SineWaveGenerator<T>::m_cycles +=
-        SineWaveGenerator<T>::m_frequency * SineWaveGenerator<T>::m_deltaTime;
-    if (SineWaveGenerator<T>::m_cycles > 1.0) {
-      SineWaveGenerator<T>::m_cycles -= 1.0;
+        SineGenerator<T>::m_cycles + SineGenerator<T>::m_phase;
+    T result = SineGenerator<T>::m_amplitude * saw(angle);
+    SineGenerator<T>::m_cycles +=
+        SineGenerator<T>::m_frequency * SineGenerator<T>::m_deltaTime;
+    if (SineGenerator<T>::m_cycles > 1.0) {
+      SineGenerator<T>::m_cycles -= 1.0;
     }
     return result;
   }
@@ -609,15 +615,23 @@ class GeneratorFromArray : public SoundGenerator<T> {
     LOGI("table_length: %d", (int)size);
   }
 
-  virtual bool begin(AudioInfo info) override {
+  /// Starts the generation of samples with the provided AudioInfo
+  bool begin(AudioInfo info) override {
     return SoundGenerator<T>::begin(info);
+  }
+
+  /// Starts the generation of samples with the provided AudioInfo and frequency
+  bool begin(AudioInfo info, float frequency) {
+    bool rc = begin(info);
+    setFrequency(frequency);
+    return rc;
   }
 
   /// Starts the generation of samples
   bool begin() override {
     TRACEI();
     SoundGenerator<T>::begin();
-    sound_index = 0;
+    sound_index = 0.0f;
     repeat_counter = 0;
     is_running = true;
     return true;
@@ -627,11 +641,21 @@ class GeneratorFromArray : public SoundGenerator<T> {
 
   /// Provides a single sample
   T readSample() override {
+    if (table.size() == 0) {
+      return 0;
+    }
+
+    if (!this->is_running) {
+      return 0;
+    }
+
+    const float table_size = static_cast<float>(table.size());
+
     // at end deactivate output
-    if (sound_index >= table.size()) {
+    while (sound_index >= table_size) {
       // LOGD("reset index - sound_index: %d, table_length:
       // %d",sound_index,table_length);
-      sound_index = 0;
+      sound_index -= table_size;
       // deactivate when count has been used up
       if (max_repeat >= 1 && ++repeat_counter >= max_repeat) {
         LOGD("atEnd");
@@ -639,13 +663,22 @@ class GeneratorFromArray : public SoundGenerator<T> {
         if (inactive_at_end) {
           this->active = false;
         }
+        return 0;
       }
     }
 
     // LOGD("index: %d - active: %d", sound_index, this->active);
     T result = 0;
     if (this->is_running) {
-      result = table[sound_index];
+      int idx0 = static_cast<int>(sound_index);
+      int idx1 = idx0 + 1;
+      if (idx1 >= static_cast<int>(table.size())) {
+        idx1 = 0;
+      }
+      float frac = sound_index - static_cast<float>(idx0);
+      float sample = static_cast<float>(table[idx0]) * (1.0f - frac) +
+                     static_cast<float>(table[idx1]) * frac;
+      result = static_cast<T>(sample);
       sound_index += index_increment;
     }
 
@@ -653,7 +686,26 @@ class GeneratorFromArray : public SoundGenerator<T> {
   }
 
   // step size the sound index is incremented (default = 1)
-  void setIncrement(int inc) { index_increment = inc; }
+  void setIncrement(int inc) {
+    index_increment = inc;
+    frequency = 0.0f;
+  }
+
+  /// Defines the output frequency based on sample rate and table size
+  void setFrequency(float frequency) override {
+    if (SoundGenerator<T>::audioInfo().sample_rate <= 0 || table.size() == 0) {
+      LOGE("setFrequency failed: sample_rate=%d table_size=%d",
+           (int)SoundGenerator<T>::audioInfo().sample_rate, (int)table.size());
+      return;
+    }
+    if (frequency < 0.0f) {
+      frequency = 0.0f;
+    }
+    this->frequency = frequency;
+    index_increment =
+        frequency * static_cast<float>(table.size()) /
+        static_cast<float>(SoundGenerator<T>::audioInfo().sample_rate);
+  }
 
   // Sets up a sine table - returns the effective frequency
   int setupSine(int sampleRate, float reqFrequency, float amplitude = 1.0) {
@@ -673,14 +725,15 @@ class GeneratorFromArray : public SoundGenerator<T> {
   bool isRunning() { return is_running; }
 
  protected:
-  int sound_index = 0;
+  float sound_index = 0.0f;
   int max_repeat = 0;
   int repeat_counter = 0;
-  bool inactive_at_end;
+  bool inactive_at_end = false;
   bool is_running = false;
   bool owns_data = false;
   Vector<T> table;
-  int index_increment = 1;
+  float index_increment = 1.0f;
+  float frequency = 0.0f;
 };
 
 /**
@@ -730,7 +783,7 @@ class GeneratorFixedValue : public SoundGenerator<T> {
 template <class T = int16_t>
 class SineFromTable : public SoundGenerator<T> {
  public:
-  SineFromTable(float amplitude = 32767.0) {
+  SineFromTable(float amplitude = NumberConverter::maxValueT<T>()) {
     this->amplitude = amplitude;
     this->amplitude_to_be = amplitude;
   }

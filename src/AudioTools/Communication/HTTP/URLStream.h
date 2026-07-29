@@ -3,13 +3,19 @@
 #include "AudioToolsConfig.h"
 
 #if defined(USE_WIFI)
-# include "WiFiInclude.h"
+#include "AudioTools/Communication/Network/Network.h"
 #endif
 
 #include "AudioTools/CoreAudio/AudioBasic/Str.h"
 #include "AudioTools/Communication/HTTP/AbstractURLStream.h"
 #include "AudioTools/Communication/HTTP/HttpRequest.h"
 #include "AudioTools/Communication/HTTP/URLStreamBufferedT.h"
+
+// UNO R3 has no WiFiClientSecure implementation, so we need to disable it
+#if !defined(USE_WIFIS3)
+#define HAS_CLIENT_SECURE
+#endif
+
 
 namespace audio_tools {
 
@@ -49,10 +55,12 @@ class URLStream : public AbstractURLStream {
   ~URLStream() {
     TRACED();
     end();
+#if defined(HAS_CLIENT_SECURE)
     if (client_secure != nullptr) {
       delete client_secure;
       client_secure = nullptr;
     }
+#endif
     if (client_insecure != nullptr) {
       delete client_insecure;
       client_insecure = nullptr;
@@ -92,7 +100,7 @@ class URLStream : public AbstractURLStream {
     }
     total_read = 0;
     active = result == 200;
-    LOGI("==> http status: %d", result);
+    LOGI("==> http result: %d", result);
     return active;
   }
 
@@ -223,7 +231,7 @@ class URLStream : public AbstractURLStream {
   /// Defines if the stream should wait for data after the request has been sent
   void setWaitForData(bool flag) { wait_for_data = flag; }
 
-  /// returns the content length 
+  /// returns the content length
   int contentLength() override { return content_length; }
 
   /// returns the total number of bytes read from the stream
@@ -238,8 +246,9 @@ class URLStream : public AbstractURLStream {
       while (request.available() == 0) {
         if (millis() > end) break;
         // stop waiting if we got an error
-        if (request.reply().statusCode() >= 300) {
-          LOGE("Error code recieved ... stop waiting for reply");
+        int rc = request.reply().statusCode();
+         if (rc >= 300) {
+          LOGE("Error code %d recieved: stop waiting for reply", rc);
           break;
         }
         delay(500);
@@ -255,7 +264,11 @@ class URLStream : public AbstractURLStream {
 
   /// Define the Root PEM Certificate for SSL
   void setCACert(const char* cert) override{
+#if defined(HAS_CLIENT_SECURE)
     if (client_secure!=nullptr) client_secure->setCACert(cert);
+#else
+    LOGE("setCACert is not supported on this platform");
+#endif
   }
 
   /// Returns the content length of the request
@@ -276,7 +289,9 @@ class URLStream : public AbstractURLStream {
   bool wait_for_data = true;
   Client* client = nullptr; // client defined via setClient
   WiFiClient* client_insecure = nullptr; // wifi client for http
+#if defined(HAS_CLIENT_SECURE)
   WiFiClientSecure* client_secure = nullptr; // wifi client for https
+#endif
   int client_timeout = URL_CLIENT_TIMEOUT;                  // 60000;
   unsigned long handshake_timeout = URL_HANDSHAKE_TIMEOUT;  // 120000
   bool is_power_save = false;
@@ -353,32 +368,49 @@ class URLStream : public AbstractURLStream {
 
   /// Determines the client
   Client& getClient(bool isSecure) {
+#if defined(HAS_CLIENT_SECURE)
     if (isSecure) {
-      if (client_secure == nullptr) {
-        client_secure = new WiFiClientSecure();
-        client_secure->setInsecure();
-        client_secure->setTimeout(client_timeout);
-#ifdef ESP32
-        client_secure->setConnectionTimeout(client_timeout);
-        client_secure->setHandshakeTimeout(handshake_timeout);
-#endif
-#ifdef RP2040_HOWER
-        client_secure->setTLSConnectTimeout(client_timeout);
-#endif
-      }
-      LOGI("WiFiClientSecure");
+      setupClientSecure();
       return *client_secure;
     }
+#endif
     if (client_insecure == nullptr) {
       client_insecure = new WiFiClient();
       client_insecure->setTimeout(client_timeout);
 #ifdef ESP32
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
       client_insecure->setConnectionTimeout(client_timeout);
+  #else
+      client_insecure->setTimeout(client_timeout);
+  #endif 
 #endif
       LOGI("WiFiClient");
     }
     return *client_insecure;
   }
+
+#if defined(HAS_CLIENT_SECURE)
+
+  void setupClientSecure() {
+      LOGI("setupClientSecure");
+      if (client_secure == nullptr) {
+        client_secure = new WiFiClientSecure();
+        client_secure->setTimeout(client_timeout);
+#ifdef ESP32
+        client_secure->setInsecure();
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+        client_secure->setConnectionTimeout(client_timeout);
+  #endif 
+        client_secure->setHandshakeTimeout(handshake_timeout);
+#endif
+#ifdef RP2040_HOWER
+        client_secure->setInsecure();
+        client_secure->setTLSConnectTimeout(client_timeout);
+#endif
+      }
+  }
+
+#endif
 
   inline void fillBuffer() {
     if (isEOS()) {

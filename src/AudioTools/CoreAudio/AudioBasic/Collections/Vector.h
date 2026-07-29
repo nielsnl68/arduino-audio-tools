@@ -127,13 +127,13 @@ class Vector {
   }
 
   /// copy constructor
-  Vector(Vector<T> &copyFrom) {
+  Vector(const Vector<T> &copyFrom) {
     this->p_allocator = copyFrom.p_allocator;
-    resize_internal(copyFrom.size(), false);
-    for (int j = 0; j < copyFrom.size(); j++) {
-      p_data[j] = copyFrom[j];
+    resize_internal(copyFrom.len, false);
+    for (int j = 0; j < copyFrom.len; j++) {
+      p_data[j] = copyFrom.p_data[j];
     }
-    this->len = copyFrom.size();
+    this->len = copyFrom.len;
   }
 
   /// convert from c array
@@ -147,12 +147,12 @@ class Vector {
   }
 
   /// copy operator
-  Vector<T> &operator=(Vector<T> &copyFrom) {
-    resize_internal(copyFrom.size(), false);
-    for (int j = 0; j < copyFrom.size(); j++) {
-      p_data[j] = copyFrom[j];
+  Vector<T> &operator=(const Vector<T> &copyFrom) {
+    resize_internal(copyFrom.len, false);
+    for (int j = 0; j < copyFrom.len; j++) {
+      p_data[j] = copyFrom.p_data[j];
     }
-    this->len = copyFrom.size();
+    this->len = copyFrom.len;
     return *this;
   }
 
@@ -263,7 +263,7 @@ class Vector {
     return p_data[index]; 
   }
 
-  bool resize(int newSize, T value) {
+  bool resize(size_t newSize, T value) {
     if (resize(newSize)) {
       for (int j = 0; j < newSize; j++) {
         p_data[j] = value;
@@ -277,11 +277,11 @@ class Vector {
 
   int capacity() { return this->bufferLen; }
 
-  bool resize(int newSize) {
+  bool resize(size_t newSize) {
     int oldSize = this->len;
     resize_internal(newSize, true);
     this->len = newSize;
-    return this->len != oldSize;
+    return this->len != oldSize && data() != nullptr;
   }
 
   iterator begin() { return iterator(p_data, 0); }

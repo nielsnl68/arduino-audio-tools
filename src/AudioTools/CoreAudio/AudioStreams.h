@@ -1,4 +1,5 @@
 #pragma once
+#include "AudioToolsConfig.h"
 #include "AudioTools/CoreAudio/AudioEffects/SoundGenerator.h"
 #include "AudioTools/CoreAudio/AudioLogger.h"
 #include "AudioTools/CoreAudio/AudioOutput.h"
@@ -7,7 +8,6 @@
 #include "AudioTools/CoreAudio/BaseConverter.h"
 #include "AudioTools/CoreAudio/BaseStream.h"
 #include "AudioTools/CoreAudio/Buffers.h"
-#include "AudioToolsConfig.h"
 
 #ifndef IRAM_ATTR
 #define IRAM_ATTR
@@ -71,6 +71,18 @@ class ModifyingStream : public AudioStream {
   virtual void setStream(Stream &in) = 0;
   /// Defines/Changes the output target
   virtual void setOutput(Print &out) = 0;
+
+  /// Defines/Changes the input & output and registers for audio change notifications
+  virtual void setStream(AudioStream &io) {
+    setStream(static_cast<Stream&>(io));
+    addNotifyAudioChange(io);
+  }
+
+  /// Defines/Changes the output target and registers for audio change notifications
+  virtual void setOutput(AudioOutput &out) {
+    setOutput(static_cast<Print&>(out));
+    addNotifyAudioChange(out);
+  }
 };
 
 /**
@@ -134,7 +146,7 @@ class MemoryStream : public AudioStream {
     return begin();
   }
 
-  /// resets the read pointer
+  /// resets the read pointer and write pointer if the memory is changeable
   bool begin() override {
     TRACED();
     write_pos = memoryCanChange() ? 0 : buffer_size;
@@ -144,6 +156,13 @@ class MemoryStream : public AudioStream {
     read_pos = 0;
     is_active = this->buffer != nullptr;
     return is_active;
+  }
+
+  /// Resets the read pointer
+  void rewind() {
+    if (buffer != nullptr && buffer_size > 0) {
+      read_pos = 0;
+    }
   }
 
   virtual size_t write(uint8_t byte) override {
@@ -181,7 +200,7 @@ class MemoryStream : public AudioStream {
       read_pos = rewind_pos;
       result = write_pos - read_pos;
       // call callback
-      if (rewind != nullptr) rewind();
+      if (rewind_cb != nullptr) rewind_cb();
     }
     return is_loop ? DEFAULT_BUFFER_SIZE : result;
   }
@@ -290,10 +309,17 @@ class MemoryStream : public AudioStream {
   virtual uint8_t *data() { return buffer; }
 
   /// update the write_pos (e.g. when we used data() to update the array)
-  virtual void setAvailable(size_t len) { this->write_pos = len; }
+  virtual bool setAvailable(size_t len) { 
+    if (len <= buffer_size) {
+      write_pos = len;
+      if (read_pos > write_pos) read_pos = write_pos;
+      return true;
+    }
+    return false;
+  }
 
   /// Callback which is executed when we rewind (in loop mode) to the beginning
-  void setRewindCallback(void (*cb)()) { this->rewind = cb; }
+  void setRewindCallback(void (*cb)()) { this->rewind_cb = cb; }
 
   /// Update the values  (buffer and size)
   void setValue(const uint8_t *buffer, int buffer_size,
@@ -313,7 +339,7 @@ class MemoryStream : public AudioStream {
   uint8_t *buffer = nullptr;
   MemoryType memory_type = RAM;
   bool is_loop = false;
-  void (*rewind)() = nullptr;
+  void (*rewind_cb)() = nullptr;
   bool is_active = false;
   bool owns_memory = true;
 
@@ -321,13 +347,44 @@ class MemoryStream : public AudioStream {
 
   void copy(MemoryStream &source) {
     if (this == &source) return;
-    if (source.memory_type == FLASH_RAM) {
-      setValue(source.buffer, source.buffer_size, source.memory_type);
-    } else {
-      setValue(nullptr, source.buffer_size, source.memory_type);
-      resize(buffer_size);
-      memcpy(buffer, source.buffer, buffer_size);
+
+    // Release currently owned mutable buffer.
+    if (memoryCanChange() && owns_memory && buffer != nullptr) {
+      free(buffer);
+      buffer = nullptr;
     }
+
+    // Shallow copy for FLASH memory source.
+    if (source.memory_type == FLASH_RAM) {
+      owns_memory = false;
+      setValue(source.buffer, source.buffer_size, source.memory_type);
+      is_active = source.is_active;
+      is_loop = source.is_loop;
+      rewind_pos = source.rewind_pos;
+      return;
+    }
+
+    // Deep copy for mutable source memory.
+    owns_memory = true;
+    setValue(nullptr, source.buffer_size, source.memory_type);
+    if (!resize(source.buffer_size)) {
+      setValue(nullptr, 0, source.memory_type);
+      is_active = false;
+      return;
+    }
+
+    if (source.buffer != nullptr && source.buffer_size > 0) {
+      memcpy(buffer, source.buffer, source.buffer_size);
+    }
+
+    write_pos = source.write_pos;
+    read_pos = source.read_pos;
+    if (write_pos > buffer_size) write_pos = buffer_size;
+    if (read_pos > write_pos) read_pos = write_pos;
+
+    is_active = source.is_active;
+    is_loop = source.is_loop;
+    rewind_pos = source.rewind_pos;
   }
 };
 
@@ -419,6 +476,9 @@ class GeneratedSoundStream : public AudioStream {
     if (newInfo.bits_per_sample != sizeof(T) * 8) {
       LOGE("Wrong bits_per_sample: %d", newInfo.bits_per_sample);
     }
+    if (p_generator != nullptr) {
+      p_generator->setAudioInfo(newInfo);
+    } 
     AudioStream::setAudioInfo(newInfo);
   }
 
@@ -804,14 +864,15 @@ class MeasuringStream : public ModifyingStream {
   uint32_t startTime() { return start_time; }
 
   void setAudioInfo(AudioInfo info) override {
-    AudioStream::info = info;
+    LOGI("MeasuringStream::setAudioInfo: %d bits, %d channels", info.bits_per_sample, info.channels);
+    ModifyingStream::setAudioInfo(info);
     setFrameSize(info.bits_per_sample / 8 * info.channels);
   }
 
   bool begin() override {
     total_bytes_since_begin = 0;
     ms_at_begin = millis();
-    return AudioStream::begin();
+    return ModifyingStream::begin();
   }
 
   bool begin(AudioInfo info) {
@@ -1192,7 +1253,7 @@ class Throttle : public ModifyingStream {
  * @copyright GPLv3
  */
 
-template <typename T=int16_t, typename SumT=int>
+template <typename T=int16_t, typename SumT=float>
 class InputMixer : public AudioStream {
  public:
   InputMixer() = default;
@@ -1269,6 +1330,14 @@ class InputMixer : public AudioStream {
       result_len = readBytesVector((T *)data, result_len);
     }
     return result_len;
+  }
+
+  /// Reports 0 when no streams are mixed in, otherwise the combined available
+  /// bytes (bounded by the least-available stream when limit_available_data
+  /// is set)
+  int available() override {
+    if (total_weights == 0 || streams.empty()) return 0;
+    return limit_available_data ? availableBytes() : DEFAULT_BUFFER_SIZE;
   }
 
   /// Limit the copy to the available data of all streams: stops to provide data
@@ -1364,8 +1433,8 @@ class InputMixer : public AudioStream {
       }
     }
     // copy result
-    for (int j = 0; j < samples; j++) {
-      p_data[j] = result_vect[j];
+    for (int j = 0; j < samples_eff_max; j++) {
+      p_data[j] = static_cast<T>(result_vect[j]);
     }
     return samples_eff_max * sizeof(T);
   }
@@ -1436,7 +1505,7 @@ class InputMerge : public AudioStream {
   size_t readBytes(uint8_t *data, size_t len) override {
     LOGD("readBytes: %d", (int)len);
     T *p_data = (T *)data;
-    int result_len = MIN(available(), len);
+    int result_len = min((size_t)available(), len);
     int frames = result_len / (sizeof(T) * total_channel_count);
     int result_idx = 0;
     for (int j = 0; j < frames; j++) {
@@ -1503,7 +1572,8 @@ class InputMerge : public AudioStream {
 
 /**
  * @brief CallbackStream: A Stream that allows to register callback methods for
- * accessing and providing data. The callbacks can be lambda expressions.
+ * accessing and providing and updating data. The callbacks can be lambda expressions.
+ * The update callback can also be used just to read the data without changing it.
  * Warning: this class does not propagate audio info changes to the target
  * stream. You need to do this manually.
  * @ingroup io
@@ -1534,14 +1604,17 @@ class CallbackStream : public ModifyingStream {
     setReadCallback(cb_read);
   }
 
+  /// Instead of writing to the output stream we call this method
   void setWriteCallback(size_t (*cb_write)(const uint8_t *data, size_t len)) {
     this->cb_write = cb_write;
   }
 
+  /// Instead of reading from the input stream we call this method
   void setReadCallback(size_t (*cb_read)(uint8_t *data, size_t len)) {
     this->cb_read = cb_read;
   }
 
+  /// After Reading or before writing we call this method to allow to modify the data
   void setUpdateCallback(size_t (*cb_update)(uint8_t *data, size_t len)) {
     this->cb_update = cb_update;
   }
@@ -1670,13 +1743,13 @@ class FilteredStream : public ModifyingStream {
   FilteredStream(Stream &stream, int channels) : ModifyingStream() {
     this->channels = channels;
     setStream(stream);
-    p_converter = new ConverterNChannels<T, TF>(channels);
+    converter.setChannels(channels);
   }
   FilteredStream(Print &stream) : ModifyingStream() { setOutput(stream); }
   FilteredStream(Print &stream, int channels) : ModifyingStream() {
     this->channels = channels;
     setOutput(stream);
-    p_converter = new ConverterNChannels<T, TF>(channels);
+    converter.setChannels(channels);
   }
 
   virtual ~FilteredStream() { end(); }
@@ -1691,10 +1764,6 @@ class FilteredStream : public ModifyingStream {
   bool begin(AudioInfo info) {
     setAudioInfo(info);
     this->channels = info.channels;
-    if (p_converter != nullptr && p_converter->getChannels() != channels) {
-      LOGE("Inconsistent number of channels");
-      return false;
-    }
     return begin();
   }
 
@@ -1703,31 +1772,24 @@ class FilteredStream : public ModifyingStream {
       LOGE("channels must not be 0");
       return false;
     }
-    if (p_converter == nullptr) {
-      p_converter = new ConverterNChannels<T, TF>(channels);
-    }
+    converter.setChannels(channels);
     return AudioStream::begin();
   }
 
   void end() override {
     ModifyingStream::end();
-    if (p_converter != nullptr) {
-      delete p_converter;
-      p_converter = nullptr;
-    }
   }
 
   virtual size_t write(const uint8_t *data, size_t len) override {
-    if (p_converter == nullptr) return 0;
-    size_t result = p_converter->convert((uint8_t *)data, len);
+    if (p_print == nullptr) return 0;
+    size_t result = converter.convert((uint8_t *)data, len);
     return p_print->write(data, result);
   }
 
   size_t readBytes(uint8_t *data, size_t len) override {
-    if (p_converter == nullptr) return 0;
     if (p_stream == nullptr) return 0;
     size_t result = p_stream->readBytes(data, len);
-    result = p_converter->convert(data, result);
+    result = converter.convert(data, result);
     return result;
   }
 
@@ -1737,6 +1799,7 @@ class FilteredStream : public ModifyingStream {
   }
 
   virtual int availableForWrite() override {
+    if (p_print == nullptr) return 0;
     return p_print->availableForWrite();
   }
 
@@ -1744,11 +1807,7 @@ class FilteredStream : public ModifyingStream {
   /// number of channels must have been defined before we can call this
   /// function.
   void setFilter(int channel, Filter<TF> *filter) {
-    if (p_converter != nullptr) {
-      p_converter->setFilter(channel, filter);
-    } else {
-      LOGE("p_converter is null");
-    }
+    converter.setFilter(channel, filter);
   }
 
   /// defines the filter for an individual channel - the first channel is 0. The
@@ -1762,7 +1821,7 @@ class FilteredStream : public ModifyingStream {
   int channels = 0;
   Stream *p_stream = nullptr;
   Print *p_print = nullptr;
-  ConverterNChannels<T, TF> *p_converter = nullptr;
+  ConverterNChannels<T, TF> converter{0};
 };
 
 /// Callback function type for activity state changes
@@ -2284,7 +2343,7 @@ class TimerCallbackAudioStream : public BufferedStream {
       frameSize = cfg.bits_per_sample * cfg.channels / 8;
       frame = new uint8_t[frameSize];
       buffer = new RingBuffer<uint8_t>(cfg.buffer_size);
-      timer = new TimerAlarmRepeating();
+      timer = new AudioTimer();
       timer->setTimerFunction(cfg.timer_function);
       if (cfg.timer_id >= 0) {
         timer->setTimer(cfg.timer_id);
@@ -2329,7 +2388,7 @@ class TimerCallbackAudioStream : public BufferedStream {
   bool active = false;
   uint16_t (*frameCallback)(uint8_t *data, uint16_t len);
   // below only relevant with timer
-  TimerAlarmRepeating *timer = nullptr;
+  AudioTimer *timer = nullptr;
   RingBuffer<uint8_t> *buffer = nullptr;
   uint8_t *frame = nullptr;
   uint16_t frameSize = 0;

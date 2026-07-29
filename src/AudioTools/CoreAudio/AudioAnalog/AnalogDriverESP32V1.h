@@ -2,7 +2,7 @@
 
 #include "AudioToolsConfig.h"
 
-#if (defined(ESP32) && defined(USE_ANALOG) &&  !USE_LEGACY_I2S) || defined(DOXYGEN)
+#if (defined(ESP32) && defined(USE_ANALOG) &&  !USE_LEGACY_I2S) 
 
 #ifdef ARDUINO
     #ifndef perimanClearPinBus
@@ -36,7 +36,7 @@ public:
 
     /// Start the Analog driver
     /// ----------------------------------------------------------
-    bool begin(AnalogConfigESP32V1 cfg) {
+    bool begin(AnalogConfigESP32V1 cfg) override {
         TRACEI();
         bool result = true;
         this->cfg = cfg;
@@ -372,7 +372,7 @@ protected:
         if (!adc_cali_handle_active || adc_cali_handle == nullptr) return;
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
         adc_cali_delete_scheme_curve_fitting(adc_cali_handle);
-#elif !defined(CONFIG_IDF_TARGET_ESP32H2) && !defined(CONFIG_IDF_TARGET_ESP32P4)
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
         adc_cali_delete_scheme_line_fitting(adc_cali_handle);
 #endif
         adc_cali_handle = nullptr;
@@ -638,7 +638,7 @@ protected:
         // Log the configuration
         LOGI("dig_cfg.sample_freq_hz: %u", (unsigned)dig_cfg.sample_freq_hz);
         LOGI("dig_cfg.conv_mode: %u (1: unit 1, 2: unit 2, 3: both)", dig_cfg.conv_mode);
-        LOGI("dig_cfg.format: %u (0 is type1: [12bit data, 4bit channel])", dig_cfg.format);
+        LOGI("dig_cfg.format: %u (0 is type1: [12bit data, 4bit channel])", (unsigned)cfg.adc_output_type);
         for (int i = 0; i < cfg.channels; i++) {
             LOGI("dig_cfg.adc_pattern[%d].atten: %u", i, dig_cfg.adc_pattern[i].atten);
             LOGI("dig_cfg.adc_pattern[%d].channel: %u", i, dig_cfg.adc_pattern[i].channel);
@@ -868,7 +868,7 @@ protected:
             cali_config.atten = (adc_atten_t)cfg.adc_attenuation;
             cali_config.bitwidth = (adc_bitwidth_t)cfg.adc_bit_width;
             err = adc_cali_create_scheme_curve_fitting(&cali_config, &adc_cali_handle);
-            #elif !defined(CONFIG_IDF_TARGET_ESP32H2) && !defined(CONFIG_IDF_TARGET_ESP32P4)
+            #elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
             // line fitting is the alternative
             adc_cali_line_fitting_config_t cali_config;
             cali_config.unit_id = cfg.adc_unit;

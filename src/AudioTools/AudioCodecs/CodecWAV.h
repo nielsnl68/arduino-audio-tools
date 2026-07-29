@@ -32,6 +32,8 @@ struct WAVAudioInfo : AudioInfo {
   uint32_t data_length = 0;
   uint32_t file_size = 0;
   int offset = 0;
+  /// write the extended 'fmt ' chunk + 'fact' chunk for ADPCM formats
+  bool ext_adpcm_header = false;
 };
 
 static const char *wav_mime = "audio/wav";
@@ -39,6 +41,25 @@ static const char *wav_mime = "audio/wav";
 /**
  * @brief Parser for Wav header data
  * for details see https://de.wikipedia.org/wiki/RIFF_WAVE
+ *
+ * Logic notes for `WAVAudioInfo` size fields:
+ * - `file_size` stores the full RIFF file size in bytes.
+ *   In the RIFF header this is written/read as `chunk_size = file_size - 8`.
+ * - `data_length` stores the WAV payload size (`data` chunk length).
+ * - `is_streamed` indicates unknown/unbounded payload length.
+ *
+ * Parsing behavior:
+ * - RIFF `chunk_size` is normalized to full `file_size` by adding 8.
+ * - If parsed `data_length` is `0` or very large (`>= 0x7fff0000`), the
+ *   stream is treated as streamed (`is_streamed=true`) and `data_length` is
+ *   normalized to `~0`.
+ *
+ * Writing behavior:
+ * - RIFF writes `file_size - 8` into the chunk-size field.
+ * - If `data_length==0` in non-streamed mode, it is derived from
+ *   `file_size - 36` (standard WAV relationship).
+ * - In streamed mode, `data_length` is written as max (`~0`) when not set.
+ * 
  * @author Phil Schatzmann
  * @copyright GPLv3
  *
@@ -53,14 +74,15 @@ class WAVHeader {
     return buffer.writeArray(data, data_len);
   }
 
-  /// Call begin when header data is complete to parse the data
+  /// Call when header data write is complete to parse the data
   bool parse() {
     LOGI("WAVHeader::begin: %u", (unsigned)buffer.available());
     this->data_pos = 0l;
     memset((void *)&headerInfo, 0, sizeof(WAVAudioInfo));
 
     if (!setPos("RIFF")) return false;
-    headerInfo.file_size = read_int32();
+    // RIFF stores chunk_size (= file_size - 8): normalize to full file size
+    headerInfo.file_size = read_int32() + 8;
     if (!setPos("WAVE")) return false;
     if (!setPos("fmt ")) return false;
     int fmt_length = read_int32();
@@ -106,13 +128,42 @@ class WAVHeader {
   void setAudioInfo(WAVAudioInfo info) { headerInfo = info; }
 
   /// Just write a wav header to the indicated outputbu
-  int writeHeader(Print *out) {
-    writeRiffHeader(buffer);
-    writeFMT(buffer);
-    writeDataHeader(buffer);
+  bool writeHeader(Print *out) {
+    return writeHeader(out, headerInfo);
+  }
+
+  /// Just write a wav header with explicit info to the indicated output
+  bool writeHeader(Print *out, const WAVAudioInfo &info) {
+    // reset first: buffer otherwise keeps accumulating bytes from earlier calls
+    buffer.reset();
+    writeRiffHeader(buffer, info);
+    writeFMT(buffer, info);
+    if (isADPCM(info.format) && info.ext_adpcm_header) {
+      writeFactChunk(buffer, info);
+    }
+    writeDataHeader(buffer, info);
     int len = buffer.available();
-    out->write(buffer.data(), buffer.available());
-    return len;
+    int written = out->write(buffer.data(), len);
+    if (written != len) {
+      LOGE("Failed to write WAV header to output: written %d of %d bytes", written, len);
+    }
+    return written == len;
+  }
+
+  /// Number of header bytes preceeding the 'data' chunk's payload, beyond the
+  /// 36 bytes of a standard PCM header (12 byte RIFF + 24 byte fmt + 8 byte
+  /// data tag/size = 36 + sizeof('fmt ' extension) + sizeof('fact' chunk)).
+  /// Only non-zero for ADPCM formats when ext_adpcm_header is enabled.
+  static int extraHeaderBytes(const WAVAudioInfo &info) {
+    if (!info.ext_adpcm_header) return 0;
+    switch (info.format) {
+      case AudioFormat::ADPCM:      // MS ADPCM: 34 byte fmt extension + 12 byte fact chunk
+        return 34 + 12;
+      case AudioFormat::DVI_ADPCM:  // IMA/DVI ADPCM: 4 byte fmt extension + 12 byte fact chunk
+        return 4 + 12;
+      default:
+        return 0;
+    }
   }
 
   /// Reset internal stored header information and buffer
@@ -142,7 +193,7 @@ class WAVHeader {
   }
 
  protected:
-  struct WAVAudioInfo headerInfo;
+  WAVAudioInfo headerInfo;
   SingleBuffer<uint8_t> buffer{MAX_WAV_HEADER_LEN};
   size_t data_pos = 0;
 
@@ -219,22 +270,106 @@ class WAVHeader {
     LOGI("WAVHeader format: %d", (int)headerInfo.format);
   }
 
-  void writeRiffHeader(BaseBuffer<uint8_t> &buffer) {
+  void writeRiffHeader(BaseBuffer<uint8_t> &buffer,
+                       const WAVAudioInfo &info) {
     buffer.writeArray((uint8_t *)"RIFF", 4);
-    write32(buffer, headerInfo.file_size - 8);
+    // chunk_size = file_size - 8 (RIFF header size)
+    uint32_t chunk_size = info.file_size > 8 ? info.file_size - 8 : 0;
+    LOGI("writeRiffHeader: file_size=%u riff_size=%u", info.file_size, chunk_size);
+    write32(buffer, chunk_size);
     buffer.writeArray((uint8_t *)"WAVE", 4);
   }
 
-  void writeFMT(BaseBuffer<uint8_t> &buffer) {
+  void writeFMT(BaseBuffer<uint8_t> &buffer, const WAVAudioInfo &info) {
+    bool is_ms_adpcm = info.ext_adpcm_header && info.format == AudioFormat::ADPCM;
+    bool is_ima_adpcm = info.ext_adpcm_header && info.format == AudioFormat::DVI_ADPCM;
     uint16_t fmt_len = 16;
+    if (is_ima_adpcm) fmt_len = 20;
+    else if (is_ms_adpcm) fmt_len = 50;
+
+    uint16_t spb = samplesPerBlock(info);
+    uint32_t byte_rate = info.byte_rate;
+    if ((is_ms_adpcm || is_ima_adpcm) && spb > 0 && info.block_align > 0) {
+      // average bytes/sec = (sample_rate * block_align) / samples_per_block
+      byte_rate = ((uint64_t)info.sample_rate * info.block_align) / spb;
+    }
+
     buffer.writeArray((uint8_t *)"fmt ", 4);
     write32(buffer, fmt_len);
-    write16(buffer, (uint16_t)headerInfo.format);  // PCM
-    write16(buffer, headerInfo.channels);
-    write32(buffer, headerInfo.sample_rate);
-    write32(buffer, headerInfo.byte_rate);
-    write16(buffer, headerInfo.block_align);  // frame size
-    write16(buffer, headerInfo.bits_per_sample);
+    write16(buffer, (uint16_t)info.format);
+    write16(buffer, info.channels);
+    write32(buffer, info.sample_rate);
+    write32(buffer, byte_rate);
+    write16(buffer, info.block_align);  // frame size
+    write16(buffer, info.bits_per_sample);
+
+    if (is_ima_adpcm) {
+      write16(buffer, 2);    // cbSize: size of extra format bytes
+      write16(buffer, spb);  // wSamplesPerBlock
+    } else if (is_ms_adpcm) {
+      // standard MS ADPCM coefficient table (7 predictor pairs)
+      static const int16_t ms_adpcm_coef[7][2] = {
+          {256, 0}, {512, -256}, {0, 0}, {192, 64},
+          {240, 0}, {460, -208}, {392, -232}};
+      write16(buffer, 32);   // cbSize: size of extra format bytes
+      write16(buffer, spb);  // wSamplesPerBlock
+      write16(buffer, 7);    // wNumCoef
+      for (auto &c : ms_adpcm_coef) {
+        write16(buffer, (uint16_t)c[0]);
+        write16(buffer, (uint16_t)c[1]);
+      }
+    }
+  }
+
+  /// 'fact' chunk: required for compressed (e.g. ADPCM) formats, holds the
+  /// total number of samples (per channel) in the data chunk.
+  void writeFactChunk(BaseBuffer<uint8_t> &buffer, const WAVAudioInfo &info) {
+    buffer.writeArray((uint8_t *)"fact", 4);
+    write32(buffer, 4);  // chunk size
+    uint32_t sample_length = 0;
+    uint16_t spb = samplesPerBlock(info);
+    if (!info.is_streamed && spb > 0 && info.block_align > 0) {
+      sample_length = (info.data_length / info.block_align) * spb;
+    }
+    write32(buffer, sample_length);
+  }
+
+  void writeDataHeader(BaseBuffer<uint8_t> &buffer, const WAVAudioInfo &info) {
+    buffer.writeArray((uint8_t *)"data", 4);
+    uint32_t data_length = info.data_length;
+    uint32_t header_bytes = 36 + extraHeaderBytes(info);
+    if (headerInfo.is_streamed && data_length == 0) {
+      data_length = ~0;  // use max value for streamed data if not set
+    }
+    if (!headerInfo.is_streamed && info.file_size >= header_bytes && (data_length == 0 || data_length == ~0)) {
+      data_length = info.file_size - header_bytes;  // data length = file size - header size
+    }
+    LOGI("writeDataHeader: data_length=%u", data_length);
+    write32(buffer, data_length);
+    int offset = info.offset;
+    if (offset > 0) {
+      uint8_t empty[offset];
+      memset(empty, 0, offset);
+      buffer.writeArray(empty, offset);  // resolve issue with wrong aligment
+    }
+  }
+
+  static bool isADPCM(AudioFormat format) {
+    return format == AudioFormat::ADPCM || format == AudioFormat::DVI_ADPCM;
+  }
+
+  /// Number of samples encoded in a single block, for ADPCM formats
+  /// (assumes 4 bits per sample as used by MS/IMA ADPCM).
+  static uint16_t samplesPerBlock(const WAVAudioInfo &info) {
+    if (info.channels <= 0 || info.block_align <= 0) return 0;
+    switch (info.format) {
+      case AudioFormat::ADPCM:  // MS ADPCM
+        return ((info.block_align / info.channels) - 7) * 2 + 2;
+      case AudioFormat::DVI_ADPCM:  // IMA/DVI ADPCM
+        return ((info.block_align / info.channels) - 4) * 2 + 1;
+      default:
+        return 0;
+    }
   }
 
   void write32(BaseBuffer<uint8_t> &buffer, uint64_t value) {
@@ -245,16 +380,6 @@ class WAVHeader {
     buffer.writeArray((uint8_t *)&value, 2);
   }
 
-  void writeDataHeader(BaseBuffer<uint8_t> &buffer) {
-    buffer.writeArray((uint8_t *)"data", 4);
-    write32(buffer, headerInfo.file_size);
-    int offset = headerInfo.offset;
-    if (offset > 0) {
-      uint8_t empty[offset];
-      memset(empty, 0, offset);
-      buffer.writeArray(empty, offset);  // resolve issue with wrong aligment
-    }
-  }
 };
 
 /**
@@ -340,6 +465,10 @@ class WAVDecoder : public AudioDecoder {
         info.bits_per_sample == 24) {
       info.bits_per_sample = 32;
     }
+    // non-PCM (e.g. ADPCM) is decoded by p_decoder to 16-bit PCM
+    if (info.format != AudioFormat::PCM) {
+      info.bits_per_sample = 16;
+    }
     return info;
   }
 
@@ -375,6 +504,9 @@ class WAVDecoder : public AudioDecoder {
   void setConvert24Bit(bool enable) {
     convert24 = enable;
   }
+
+  /// Access to the internal header parser and info
+  WAVHeader &getHeader() { return header; }
 
  protected:
   WAVHeader header;
@@ -584,16 +716,6 @@ class WAVEncoder : public AudioEncoder {
       wav_info.block_align =
           wav_info.bits_per_sample / 8 * wav_info.channels;
     }
-    if (wav_info.is_streamed || wav_info.data_length == 0 ||
-        wav_info.data_length >= 0x7fff0000) {
-      LOGI("is_streamed! because length is %u",
-           (unsigned)wav_info.data_length);
-      wav_info.is_streamed = true;
-      wav_info.data_length = ~0;
-    } else {
-      size_limit = wav_info.data_length;
-      LOGI("size_limit is %d", (int)size_limit);
-    }
   }
 
   /// starts the processing
@@ -607,6 +729,21 @@ class WAVEncoder : public AudioEncoder {
   virtual bool begin() override {
     TRACED();
     setupEncodedAudio();
+
+    // normalize streaming mode and payload limits at start time
+    if (wav_info.is_streamed || wav_info.data_length == 0 ||
+        wav_info.data_length >= 0x7fff0000) {
+      LOGI("is_streamed! because length is %u",
+           (unsigned)wav_info.data_length);
+      wav_info.is_streamed = true;
+      wav_info.data_length = ~0;
+      size_limit = 0;
+    } else {
+      wav_info.is_streamed = false;
+      size_limit = wav_info.data_length;
+      LOGI("size_limit is %d", (int)size_limit);
+    }
+
     header_written = false;
     is_open = true;
     return true;
@@ -629,15 +766,17 @@ class WAVEncoder : public AudioEncoder {
 
     if (!header_written) {
       LOGI("Writing Header");
-      header.setAudioInfo(wav_info);
-      int len = header.writeHeader(p_print);
-      wav_info.file_size -= len;
+      if (!header.writeHeader(p_print, wav_info)) {
+        LOGE("Failed to write WAV header");
+        is_open = false;
+        return 0;
+      }
       header_written = true;
     }
 
     int32_t result = 0;
     Print *p_out = p_encoder == nullptr ? p_print : &enc_out;
-    ;
+    
     if (wav_info.is_streamed) {
       result = p_out->write((uint8_t *)data, len);
     } else if (size_limit > 0) {
@@ -661,6 +800,30 @@ class WAVEncoder : public AudioEncoder {
 
   /// Adds n empty bytes at the beginning of the data
   void setDataOffset(uint16_t offset) { wav_info.offset = offset; }
+
+  /// Writes the extended 'fmt ' chunk + 'fact' chunk for ADPCM formats
+  /// (disabled by default - the standard 16-byte 'fmt ' chunk is written)
+  void setExtADPCMHeader(bool enable) { wav_info.ext_adpcm_header = enable; }
+
+  /// Defines the WAV payload length in bytes (without header)
+  void setDataLength(uint32_t data_length) {
+    wav_info.data_length = data_length;
+    wav_info.is_streamed =
+        (data_length == 0 || data_length >= 0x7fff0000);
+    if (!wav_info.is_streamed) {
+      // full file size = RIFF chunk (36) + format specific extra header
+      // bytes (e.g. ADPCM 'fmt ' extension + 'fact' chunk) + data chunk payload
+      wav_info.file_size = wav_info.data_length + 36 +
+                            WAVHeader::extraHeaderBytes(wav_info);
+    }
+    setAudioInfo(wav_info);
+  }
+
+  /// Extended WAV specific info
+  WAVAudioInfo &audioInfoEx() { return wav_info; }
+
+  /// Access to the internal header parser and info
+  WAVHeader &getHeader() { return header; }
 
  protected:
   WAVHeader header;
